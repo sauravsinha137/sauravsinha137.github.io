@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HLD Problem: Design Uber — Kumar Saurav — Interview Prep Notes</title>
+<meta name="description" content="HLD: HLD Problem: Design Uber">
+<link rel="canonical" href="https://sauravsinha137.github.io/design-uber/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/site.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.12.0/mermaid.min.js"></script><script>mermaid.initialize({startOnLoad:true,theme:"neutral"});</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script><script>hljs.highlightAll();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><a class="brand" href="/">Kumar Saurav — Interview Prep Notes</a></header>
+<main id="main">
+<article class="post">
+  <p class="kicker">HLD · Design problem · intermediate</p>
+  <h1>HLD Problem: Design Uber</h1>
+  <p class="meta"><time datetime="2026-10-02">2 Oct 2026</time> · 18 min read</p>
+  
+  <div class="body">
+<h2 id="designing-uber-a-deep-walkthrough">Designing Uber: A Deep Walkthrough</h2>
+<blockquote>
+<p>A long-form writeup of the classic &quot;design a ride-sharing service&quot; interview problem, inspired by the <a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/uber">Hello Interview breakdown</a>, with my own diagrams, numbers, and commentary layered on top. Diagrams are in Mermaid — render in any Mermaid-aware viewer (GitHub, Obsidian, VS Code).</p>
+</blockquote>
+<p>Uber looks deceptively simple from the outside: two apps, one button, a car shows up. Underneath, it&#39;s one of the hardest classes of system to build well, because it combines <strong>three problems that are individually hard</strong>:</p>
+<ol>
+<li>A <strong>geospatial firehose</strong> — millions of GPS pings per second that must be queryable in real time</li>
+<li>A <strong>distributed mutual-exclusion problem</strong> — a driver is a physical resource that cannot be double-booked</li>
+<li>A <strong>human-in-the-loop workflow</strong> — humans take seconds to respond, ignore their phones, and drive through tunnels</li>
+</ol>
+<p>Most of the interesting design decisions fall out of these three tensions. Let&#39;s build it up.</p>
+<h2 id="1-scoping-the-problem">1. Scoping the Problem</h2>
+<h3 id="functional-requirements-the-top-4">Functional requirements (the top 4)</h3>
+<ol>
+<li>Riders enter a pickup + destination and get a <strong>fare estimate</strong></li>
+<li>Riders can <strong>request a ride</strong> against that estimate</li>
+<li>The system <strong>matches</strong> the rider with a nearby, available driver</li>
+<li>Drivers can <strong>accept/decline</strong> and navigate to pickup/drop-off</li>
+</ol>
+<p>Deliberately below the line: ratings, scheduled rides, ride tiers (X/XL/Comfort), payments. In a 45-minute interview, scoping <em>is</em> the skill — the interviewer wants to see you pick the 3–4 requirements that expose the hard parts and park the rest explicitly.</p>
+<h3 id="non-functional-requirements-where-the-real-design-lives">Non-functional requirements — where the real design lives</h3>
+<table>
+<thead>
+<tr>
+<th>NFR</th>
+<th>Why it&#39;s the hard part</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Low-latency matching</strong> (match or fail &lt; 1 min)</td>
+<td>Matching is a multi-step, human-gated workflow. Every second of driver hesitation eats your budget.</td>
+</tr>
+<tr>
+<td><strong>Strong consistency in matching</strong></td>
+<td>A driver is a physical resource. Double-assigning one isn&#39;t an eventual-consistency inconvenience — it&#39;s two riders standing on curbs and one of them getting stood up.</td>
+</tr>
+<tr>
+<td><strong>Burst throughput</strong> (~100k requests from one geo cell)</td>
+<td>Demand is violently non-uniform: a concert ends, a metro line dies, it starts raining. Your quiet-Tuesday architecture must survive New Year&#39;s Eve.</td>
+</tr>
+</tbody></table>
+<p>Notice the shape: the FRs give you the boxes, the NFRs give you the deep dives. This is a general truth of system design interviews.</p>
+<hr>
+<h2 id="2-core-entities-and-data-model">2. Core Entities and Data Model</h2>
+<pre class="mermaid">erDiagram
+    RIDER ||--o{ FARE : requests
+    RIDER ||--o{ RIDE : takes
+    DRIVER ||--o{ RIDE : fulfills
+    DRIVER ||--|| LOCATION : &quot;has latest&quot;
+    FARE ||--o| RIDE : &quot;confirmed as&quot;
+
+    RIDER {
+        uuid rider_id PK
+        string name
+        string payment_method
+    }
+    DRIVER {
+        uuid driver_id PK
+        string vehicle_info
+        enum status &quot;available | outstanding_request | in_ride | offline&quot;
+    }
+    FARE {
+        uuid fare_id PK
+        uuid rider_id FK
+        point pickup
+        point destination
+        decimal estimated_fare
+        int eta_seconds
+        timestamp created_at
+    }
+    RIDE {
+        uuid ride_id PK
+        uuid fare_id FK
+        uuid rider_id FK
+        uuid driver_id FK &quot;null until matched&quot;
+        enum status &quot;requested | matched | accepted | in_progress | completed | cancelled&quot;
+        decimal actual_fare
+        timestamp pickup_at
+        timestamp dropoff_at
+    }
+    LOCATION {
+        uuid driver_id PK
+        float lat
+        float long
+        timestamp updated_at
+    }</pre>
+<p>Two modelling notes worth calling out:</p>
+<ul>
+<li><strong>Fare as a separate entity</strong> is a quote pattern. The estimate is a server-signed offer with its own lifecycle (created → maybe accepted → expired). Splitting it out means the client can never tamper with the price — the ride request only carries a <code>fareId</code>, and the server looks up the number it committed to. It also gives you a natural place for quote expiry (&quot;this fare is valid for 5 minutes&quot;).</li>
+<li><strong>Location is not really a table.</strong> It&#39;s drawn as one here, but the whole first deep dive is about why it must <em>not</em> live in your primary database. Hold that thought.</li>
+</ul>
+<hr>
+<h2 id="3-api-surface">3. API Surface</h2>
+<pre><code>POST  /fare                → Fare        { pickupLocation, destination }
+POST  /rides               → Ride        { fareId }
+POST  /drivers/location    → 200/4xx     { lat, long }
+PATCH /rides/:rideId       → Ride        { action: &quot;accept&quot; | &quot;deny&quot; }</code></pre>
+<p>The API is small — four endpoints cover everything above. What matters more than the endpoints is the <strong>trust boundary discipline</strong>:</p>
+<ul>
+<li><code>riderId</code> / <code>driverId</code> come from the <strong>session or JWT</strong>, never the body. A body-supplied ID is an impersonation vector.</li>
+<li>Timestamps are <strong>server-generated</strong>. Client clocks lie, both accidentally and maliciously.</li>
+<li>The fare amount is <strong>looked up from the DB</strong> via <code>fareId</code>. If the client could send <code>fare: 0.01</code>, someone would.</li>
+</ul>
+<p>This shows up constantly in interview feedback: candidates who pass <code>userId</code> in the request body are signalling they&#39;ve never thought about where the trust boundary sits. The same instinct applies at TrueCredits-style fintech scale — anything that touches money must be re-derived server-side.</p>
+<p>Note there&#39;s no &quot;match me a driver&quot; endpoint. Matching is a <strong>backend workflow triggered by</strong> <code>POST /rides</code>, not something the client orchestrates. The client&#39;s job ends at expressing intent.</p>
+<hr>
+<h2 id="4-high-level-architecture">4. High-Level Architecture</h2>
+<pre class="mermaid">flowchart TB
+    RC[Rider Client] --&gt; GW[API Gateway&lt;br/&gt;auth · rate limiting · routing]
+    DC[Driver Client] --&gt; GW
+
+    GW --&gt; RS[Ride Service&lt;br/&gt;fare estimates · ride lifecycle]
+    GW --&gt; LS[Location Service&lt;br/&gt;ingests driver GPS pings]
+
+    RS --&gt; MAPS[3rd-Party Maps API&lt;br/&gt;distance · ETA · routing]
+    RS --&gt; DB[(Primary DB&lt;br/&gt;riders · drivers · fares · rides)]
+    RS --&gt;|enqueue match request| Q[[Match Queue]]
+    Q --&gt; MS[Ride Matching Service&lt;br/&gt;rank candidates · manage offers]
+
+    LS --&gt; GEO[(Redis GEO&lt;br/&gt;live driver positions)]
+    MS --&gt; GEO
+    MS --&gt; DB
+    MS --&gt; NS[Notification Service&lt;br/&gt;APNs / FCM]
+    NS -.push ride offer.-&gt; DC</pre>
+<p>Five services, each with one job:</p>
+<table>
+<thead>
+<tr>
+<th>Service</th>
+<th>Responsibility</th>
+<th>Why it&#39;s separate</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>API Gateway</strong></td>
+<td>Auth, rate limiting, routing</td>
+<td>Cross-cutting concerns don&#39;t belong in business services</td>
+</tr>
+<tr>
+<td><strong>Ride Service</strong></td>
+<td>Fare quotes + ride state machine</td>
+<td>Owns the source of truth for a ride&#39;s lifecycle</td>
+</tr>
+<tr>
+<td><strong>Location Service</strong></td>
+<td>Absorb the GPS firehose</td>
+<td>Its write profile (2M/s, tiny payloads, overwrite semantics) is nothing like the ride path&#39;s — different scaling story entirely</td>
+</tr>
+<tr>
+<td><strong>Ride Matching Service</strong></td>
+<td>Find and offer drivers</td>
+<td>The workflow brain; scales with demand, not with driver count</td>
+</tr>
+<tr>
+<td><strong>Notification Service</strong></td>
+<td>APNs/FCM fan-out</td>
+<td>Push delivery is its own operational domain (token management, retries, platform quirks)</td>
+</tr>
+</tbody></table>
+<p>The Location/Matching split is the one candidates most often miss. Location ingestion is a <em>write-heavy, loss-tolerant, latest-value-wins</em> problem. Matching is a <em>read-heavy, correctness-critical</em> problem. Coupling them means scaling both for the worst case of either.</p>
+<h3 id="flow-1-fare-estimate">Flow 1 — Fare estimate</h3>
+<pre class="mermaid">sequenceDiagram
+    participant R as Rider Client
+    participant G as API Gateway
+    participant RS as Ride Service
+    participant M as Maps API
+    participant DB as Database
+
+    R-&gt;&gt;G: POST /fare {pickup, destination}
+    G-&gt;&gt;G: authenticate, rate-limit
+    G-&gt;&gt;RS: forward
+    RS-&gt;&gt;M: route(pickup → destination)
+    M--&gt;&gt;RS: distance, duration
+    RS-&gt;&gt;RS: apply pricing model
+    RS-&gt;&gt;DB: INSERT Fare (price, eta)
+    DB--&gt;&gt;RS: fare_id
+    RS--&gt;&gt;R: Fare {id, price, eta}
+    Note over R: Rider sees &quot;₹340 · 18 min&quot;&lt;br/&gt;and decides</pre>
+<p>Straightforward request/response. The one subtlety: persisting the Fare <em>now</em> is what makes the later <code>POST /rides {fareId}</code> tamper-proof.</p>
+<h3 id="flow-2-3-request-and-match">Flow 2 + 3 — Request and match</h3>
+<pre class="mermaid">sequenceDiagram
+    participant R as Rider Client
+    participant RS as Ride Service
+    participant Q as Match Queue
+    participant MS as Matching Service
+    participant GEO as Redis GEO
+    participant NS as Notifications
+    participant D as Driver Client
+
+    R-&gt;&gt;RS: POST /rides {fareId}
+    RS-&gt;&gt;RS: create Ride (status=requested)
+    RS-&gt;&gt;Q: enqueue(rideId)
+    RS--&gt;&gt;R: Ride accepted for matching
+
+    Note over D,GEO: Meanwhile, continuously:
+    D--)GEO: location pings (adaptive interval)
+
+    Q-&gt;&gt;MS: dequeue(rideId)
+    MS-&gt;&gt;GEO: GEOSEARCH pickup radius 2km
+    GEO--&gt;&gt;MS: [d17, d42, d08, ...]
+    MS-&gt;&gt;MS: rank (proximity, rating, acceptance rate)
+    MS-&gt;&gt;NS: offer ride to d17
+    NS--)D: push: &quot;New ride request&quot;</pre>
+<p>Note the rider gets a response <em>before</em> a driver is found — the request is accepted for matching, and match results arrive asynchronously (push/WebSocket). Making the rider&#39;s HTTP call block on a human driver&#39;s thumb would be a latency and connection-management disaster.</p>
+<h3 id="flow-4-accept-decline">Flow 4 — Accept / decline</h3>
+<pre class="mermaid">sequenceDiagram
+    participant D as Driver Client
+    participant RS as Ride Service
+    participant DB as Database
+    participant MS as Matching Service
+
+    D-&gt;&gt;RS: PATCH /rides/:id {accept}
+    RS-&gt;&gt;DB: status=accepted, driver_id=d17
+    RS--&gt;&gt;D: Ride {pickup coords, rider info}
+    Note over D: navigates via on-device GPS
+
+    alt driver declines or times out (10s)
+        MS-&gt;&gt;MS: advance to next ranked driver
+    end</pre>
+<p>That innocent-looking <code>alt</code> box — &quot;or times out&quot; — is deep dives 3 and 5. It&#39;s where most of the system&#39;s real complexity hides.</p>
+<hr>
+<h2 id="5-deep-dive-1-the-gps-firehose">5. Deep Dive 1 — The GPS Firehose</h2>
+<p><strong>The math that kills the naive design:</strong> 10M active drivers × 1 ping / 5s = <strong>2M writes/sec</strong>. On DynamoDB on-demand pricing that&#39;s roughly <strong>$200k+/day</strong> just to record positions. On Postgres it&#39;s a wall of WAL and vacuum pressure. And it buys you nothing, because the <em>reads</em> are broken too: proximity search on lat/long columns with B-tree indexes degenerates to scans — B-trees order one dimension at a time, and &quot;near (x, y)&quot; is irreducibly two-dimensional.</p>
+<p>Three escalating answers:</p>
+<h3 id="naive-write-every-ping-to-the-primary-db">❌ Naive: write every ping to the primary DB</h3>
+<p>Dead on arrival at this scale. Worth stating in an interview only to establish the baseline you&#39;re escaping.</p>
+<h3 id="better-batch-writes-a-real-geospatial-index">🟡 Better: batch writes + a real geospatial index</h3>
+<p>Buffer pings, flush in batches, and use a proper spatial structure — a <strong>quad-tree</strong> (recursively split the plane into quadrants; dense areas subdivide deeper) or Postgres with <strong>PostGIS</strong> (R-tree-backed GiST indexes). Batching slashes write ops; the spatial index makes radius queries logarithmic-ish.</p>
+<p>The flaw is the batching window itself: your view of driver positions is always one flush interval stale. A driver doing 60 km/h moves ~85m in 5 seconds. In a dense city grid, stale data means offering rides to drivers who just turned the wrong way.</p>
+<h3 id="best-redis-geo-treat-location-as-ephemeral-in-memory-state">✅ Best: Redis GEO — treat location as ephemeral, in-memory state</h3>
+<p>The reframe that unlocks this: <strong>driver location isn&#39;t data you store; it&#39;s state you overwrite.</strong> You never need position history for matching — only the latest fix. That&#39;s exactly what an in-memory store is for.</p>
+<p>Redis&#39;s GEO commands are built on a sorted set. <code>GEOADD</code> interleaves the bits of latitude and longitude into a <strong>52-bit geohash</strong> used as the member&#39;s score. Interleaving means nearby points get numerically close scores, so a radius query (<code>GEOSEARCH</code>) becomes a handful of range scans over the sorted set plus a precise distance filter — microseconds, in memory.</p>
+<pre><code># every ping:
+GEOADD drivers:blr 77.5946 12.9716 driver:8842      # overwrite = free &quot;compaction&quot;
+ZADD   drivers:blr:seen 1720877700 driver:8842       # companion freshness set
+
+# matching:
+GEOSEARCH drivers:blr FROMLONLAT 77.60 12.97 BYRADIUS 2 km ASC COUNT 20
+
+# liveness sweep (every ~10s):
+ZRANGEBYSCORE drivers:blr:seen 0 &lt;now - 30s&gt;          # → ZREM + GEO ZREM</code></pre>
+<p>Because each <code>GEOADD</code> replaces the previous entry, there is no unbounded growth and no batching delay — the store <em>is</em> the current world state. Stale drivers (app killed, tunnel, dead battery) are reaped by the companion timestamp set.</p>
+<p><strong>&quot;But Redis isn&#39;t durable!&quot;</strong> — correct, and here it doesn&#39;t matter, which is the elegant part. If the whole cluster loses its memory, drivers repopulate it within one ping cycle (~5s). The data&#39;s natural refresh rate exceeds any realistic recovery time. Add RDB/AOF persistence and Sentinel failover as belt-and-braces, but the architecture is safe even without them. This is a great interview moment: recognizing <em>which</em> data actually needs durability, instead of reflexively demanding it everywhere.</p>
+<pre class="mermaid">flowchart LR
+    subgraph drivers [10M drivers]
+        D1[🚗] &amp; D2[🚗] &amp; D3[🚗]
+    end
+    drivers --&gt;|~2M pings/sec| LS[Location Service]
+    LS --&gt;|GEOADD overwrite| R[(Redis GEO&lt;br/&gt;geohash sorted set)]
+    SW[Liveness sweeper] --&gt;|evict silent &gt; 30s| R
+    MS[Matching Service] --&gt;|GEOSEARCH r=2km| R</pre>
+<hr>
+<h2 id="6-deep-dive-2-shrinking-the-firehose-at-the-source">6. Deep Dive 2 — Shrinking the Firehose at the Source</h2>
+<p>Even with Redis absorbing 2M writes/sec comfortably, most of those pings are <em>informationally worthless</em>. A driver parked at a chai stall for 20 minutes sends 240 identical updates.</p>
+<p>The fix lives on the <strong>client</strong>: adaptive ping intervals. The driver app already has an accelerometer, GPS speed, and knowledge of its own state — use them:</p>
+<table>
+<thead>
+<tr>
+<th>Context</th>
+<th>Interval</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Stationary, no pending offer</td>
+<td>30–60s</td>
+<td>Position isn&#39;t changing; a heartbeat suffices</td>
+</tr>
+<tr>
+<td>Slow / stop-and-go traffic</td>
+<td>10–15s</td>
+<td>Low positional drift per interval</td>
+</tr>
+<tr>
+<td>Highway speed or frequent turns</td>
+<td>2–3s</td>
+<td>25 m/s means 5s gaps = 125m errors</td>
+</tr>
+<tr>
+<td>Offer pending / en route to pickup</td>
+<td>max frequency</td>
+<td>Rider is watching the car icon</td>
+</tr>
+</tbody></table>
+<p>Realistic effect: an order-of-magnitude reduction in aggregate pings, since the fleet skews heavily toward idle-and-slow at any moment.</p>
+<p>The transferable lesson — and interviewers explicitly look for it — is <strong>don&#39;t draw the client as a dumb box</strong>. The same move shows up everywhere: file-upload services push chunking and compression to the client; sync engines push diffing to the client. The client is a distributed fleet of computers you already pay nothing to run.</p>
+<hr>
+<h2 id="7-deep-dive-3-never-double-book-a-driver">7. Deep Dive 3 — Never Double-Book a Driver</h2>
+<p>The consistency NFR, concretely: at any instant, <strong>one driver ↔ at most one outstanding offer</strong>, and the offer holds for a bounded window (10s) before the system moves on. Structurally identical to Ticketmaster&#39;s seat hold: reserve a contended resource for a short window, release automatically if unclaimed.</p>
+<h3 id="app-level-locks-in-process-map-timer">❌ App-level locks (in-process map + timer)</h3>
+<p>Multiple Matching Service instances each keeping their own lock table means no shared truth: two instances can offer the same driver simultaneously (race), and a crashed instance takes its locks and timers to the grave, leaving drivers frozen in a phantom &quot;offered&quot; state. In-process state for cross-instance coordination is the root error.</p>
+<h3 id="status-column-in-the-db">🟡 Status column in the DB</h3>
+<p>Move the lock into the database and let transactions arbitrate:</p>
+<pre><code class="language-sql">UPDATE drivers SET status = &#39;outstanding_request&#39;
+WHERE driver_id = ? AND status = &#39;available&#39;;
+-- 1 row updated → you hold the driver. 0 rows → someone beat you.</code></pre>
+<p>The compare-and-swap in the <code>WHERE</code> clause fixes coordination cleanly. What&#39;s still broken is the <strong>release path</strong>: expiring the hold after 10s relies on an in-memory timer (dies with the process) or a sweep cron (adds lag and moving parts). Locks acquired reliably but released unreliably are how you end up with a fleet of permanently &quot;busy&quot; drivers at 2 a.m.</p>
+<h3 id="redis-lock-with-ttl-let-the-datastore-own-the-deadline">✅ Redis lock with TTL — let the datastore own the deadline</h3>
+<pre><code>SET driver_lock:8842 ride:xyz NX PX 10000</code></pre>
+<p><code>NX</code> gives atomic acquire-if-absent; <code>PX 10000</code> attaches a 10-second self-destruct. The genius is that <strong>expiry is the datastore&#39;s job, not your process&#39;s</strong>. Every failure mode collapses into the same safe outcome:</p>
+<pre class="mermaid">stateDiagram-v2
+    [*] --&gt; Available
+    Available --&gt; Locked: SET NX PX 10000 succeeds
+    Locked --&gt; Accepted: driver taps accept&lt;br/&gt;(DB update + DEL lock)
+    Locked --&gt; Available: driver declines (DEL)
+    Locked --&gt; Available: 10s TTL expires&lt;br/&gt;(driver asleep, app dead,&lt;br/&gt;matcher crashed — same result)
+    Accepted --&gt; [*]</pre>
+<p>Matcher crashes mid-offer? TTL expires, driver frees. Driver drops phone in the passenger seat? TTL expires. Network partition? TTL expires. You&#39;ve replaced three failure-handling code paths with zero.</p>
+<p>The dependency on Redis availability is real but proportionate: locks live 10 seconds. Even a total Redis loss self-heals within one offer window — the same ephemerality argument as the GEO store. (For those who&#39;ve read about Redlock debates: single-instance + Sentinel is defensible here precisely because the correctness window is so short and the downside is a re-offered ride, not corrupted money.)</p>
+<hr>
+<h2 id="8-deep-dive-4-surviving-the-concert-letting-out">8. Deep Dive 4 — Surviving the Concert Letting Out</h2>
+<p>100k ride requests from one stadium in two minutes. Two distinct failure modes to defend against: <strong>overload</strong> (requests arrive faster than matchers can process) and <strong>loss</strong> (a matcher instance dies holding in-flight requests).</p>
+<p>Synchronous processing fails both: autoscaling reacts in minutes, spikes happen in seconds; and a crashed instance&#39;s in-flight requests simply vanish — a rider staring at a spinner for a match that will never come.</p>
+<h3 id="kafka-between-ride-service-and-matching-service">✅ Kafka between Ride Service and Matching Service</h3>
+<pre class="mermaid">flowchart LR
+    RS[Ride Service] --&gt;|produce ride request| K
+    subgraph K [Kafka — partitioned by geo region]
+        P1[blr-south]
+        P2[blr-north]
+        P3[mum-central]
+    end
+    P1 --&gt; M1[Matcher 1]
+    P2 --&gt; M2[Matcher 2]
+    P3 --&gt; M3[Matcher 3]
+    AS[Autoscaler] -.-&gt;|consumer lag high → add matchers| M3</pre>
+<p>The queue buys three things at once:</p>
+<ol>
+<li><strong>Elasticity</strong> — the queue absorbs the spike; matchers drain at their own pace and scale on <em>consumer lag</em>, a far better autoscaling signal than CPU.</li>
+<li><strong>Durability</strong> — the make-or-break detail: <strong>commit the consumer offset only after the match completes.</strong> A matcher that dies mid-match never committed, so Kafka redelivers to the next consumer in the group. Crash-safety falls out of the offset protocol for free. (Same pattern as <code>SELECT ... FOR UPDATE SKIP LOCKED</code> job queues — claim, process, then ack — just with Kafka&#39;s offset as the ack.)</li>
+<li><strong>Locality</strong> — partitioning by geo region means Bengaluru&#39;s surge never queues behind Mumbai&#39;s, and each matcher holds a warm view of one region&#39;s drivers.</li>
+</ol>
+<p>Two honest caveats: it&#39;s more infrastructure to run (managed Kafka — MSK/Confluent — is the sane default), and strict FIFO within a partition invites head-of-line blocking behind one slow match. If that bites, layer priority semantics on top (separate high/low-priority topics, or re-enqueue slow matches).</p>
+<hr>
+<h2 id="9-deep-dive-5-the-driver-who-never-answers">9. Deep Dive 5 — The Driver Who Never Answers</h2>
+<p>Deep dive 3 freed the <em>driver</em> when an offer times out. But who advances the <em>ride</em> to the next candidate? A <code>sleep(10)</code> in the matcher is a bug: the process restarts and the ride is orphaned forever. This is the human-in-the-loop problem in its purest form — you need timeouts and retries that <strong>outlive the process that scheduled them</strong>.</p>
+<h3 id="delay-queue">🟡 Delay queue</h3>
+<p>On offering driver N, also enqueue a message with a 10s delivery delay: &quot;check ride X.&quot; When it fires, if the ride is still unassigned, offer driver N+1 and schedule the next check. The timer now survives crashes because it lives in the queue.</p>
+<p>Workable, but the cancellation semantics get fiddly: a driver who accepts at second 9.8 races the already-scheduled check, so the check handler must re-verify state atomically (against the DB status or the Redis lock) before acting. You end up hand-assembling a state machine out of queue messages and conditional checks — every edge case is yours to find.</p>
+<h3 id="durable-execution-temporal-step-functions">✅ Durable execution (Temporal / Step Functions)</h3>
+<p>The cleaner answer: stop assembling the state machine and <em>write it as code</em> in a framework that persists execution state:</p>
+<pre><code>workflow matchRide(rideId):
+    for driver in rankedCandidates(rideId):
+        offer(driver)                        # activity
+        result = await accept OR timer(10s)  # durable — survives crashes
+        if result == accepted:
+            return assign(driver)
+        # decline or timeout → next candidate
+    return noDriversAvailable(rideId)</code></pre>
+<p>Every <code>await</code> is checkpointed. Kill the worker at any line; another worker resumes at exactly that line with all state intact. Timeouts, retries, and the accept-vs-timer race are framework primitives instead of hand-rolled queue choreography.</p>
+<p>The historical footnote makes this answer land especially well: <strong>Uber built Cadence</strong> — Temporal&#39;s direct ancestor — precisely because ride matching is this problem. The canonical company&#39;s answer to the canonical question was &quot;build a durable execution engine.&quot;</p>
+<p>Cost: a new orchestration system to operate and a real learning curve (deterministic workflow code, versioning). For a flow where every dropped request is lost revenue and a stranded human, the trade is usually right.</p>
+<hr>
+<h2 id="10-deep-dive-6-scaling-out-geography-is-the-shard-key">10. Deep Dive 6 — Scaling Out: Geography Is the Shard Key</h2>
+<p>Vertical scaling gets one sentence: it&#39;s a ceiling, a cost curve, and a single point of failure — mention it only to dismiss it.</p>
+<p>The right lens: <strong>a ride in Bengaluru never needs to know about a driver in Mumbai.</strong> Ride-sharing is embarrassingly partitionable by geography, so shard <em>everything</em> — services, Kafka topics, Redis GEO stores, databases — by region, and add read replicas within each shard for read-heavy paths.</p>
+<pre class="mermaid">flowchart TB
+    subgraph BLR [Bengaluru shard]
+        A1[Services] --&gt; A2[(Redis GEO)] &amp; A3[(DB + replicas)]
+    end
+    subgraph MUM [Mumbai shard]
+        B1[Services] --&gt; B2[(Redis GEO)] &amp; B3[(DB + replicas)]
+    end
+    GR[Geo router / gateway] --&gt; BLR &amp; MUM
+    BLR &lt;-.-&gt;|scatter-gather only at&lt;br/&gt;shard boundaries| MUM</pre>
+<p>Two compounding wins:</p>
+<ul>
+<li><strong>Latency</strong> — requests terminate in-region instead of crossing the country; matching data is local by construction.</li>
+<li><strong>Blast radius</strong> — a bad deploy or Redis incident in one region degrades one city, not the platform.</li>
+</ul>
+<p>The only cross-shard case is a proximity search near a boundary (rider standing at the edge of two regions), handled by scatter-gathering the adjacent shards and merging. Keep boundaries in low-density areas and this stays rare. Use consistent hashing / careful boundary design for rebalancing as cities grow, and watch for hot shards — &quot;Bengaluru&quot; may itself need splitting long before &quot;all of Karnataka&quot; does.</p>
+<hr>
+<h2 id="11-the-assembled-system">11. The Assembled System</h2>
+<pre class="mermaid">flowchart TB
+    RC[Rider Client] &amp; DC[Driver Client&lt;br/&gt;adaptive ping intervals] --&gt; GW[API Gateway]
+
+    GW --&gt; RS[Ride Service]
+    GW --&gt; LS[Location Service]
+
+    RS --&gt; MAPS[Maps API]
+    RS --&gt; DB[(Primary DB&lt;br/&gt;fares · rides · drivers)]
+    RS --&gt;|produce| K[[Kafka&lt;br/&gt;geo-partitioned&lt;br/&gt;commit offset after match]]
+
+    LS --&gt;|GEOADD| GEO[(Redis GEO&lt;br/&gt;live positions, TTL sweep)]
+
+    K --&gt; MS[Matching Service&lt;br/&gt;Temporal workflow:&lt;br/&gt;offer → 10s timer → next]
+    MS --&gt;|GEOSEARCH| GEO
+    MS --&gt;|SET NX PX 10000| LOCK[(Redis locks&lt;br/&gt;driver exclusivity)]
+    MS --&gt; DB
+    MS --&gt; NS[Notification Service] -.APNs / FCM.-&gt; DC
+
+    style GEO fill:#1a4d2e,color:#fff
+    style LOCK fill:#1a4d2e,color:#fff
+    style K fill:#4d3319,color:#fff
+    style MS fill:#2d2d4d,color:#fff</pre>
+<p>One pattern worth noticing across all six deep dives: <strong>the ephemerality of the data kept licensing simpler designs.</strong> Locations refresh every 5s → Redis without durability guarantees is fine. Locks live 10s → single-instance Redis locking is fine. The only data that demands real durability — the ride itself and the money attached to it — lives in the primary DB and the Kafka log. Matching data lifetime to storage guarantees, instead of demanding maximum durability uniformly, is the quiet theme of the whole design.</p>
+<hr>
+<h2 id="12-what-interviewers-expect-by-level">12. What Interviewers Expect, by Level</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Mid (E4)</th>
+<th>Senior (E5)</th>
+<th>Staff+</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Breadth : depth</td>
+<td>80 : 20</td>
+<td>60 : 40</td>
+<td>40 : 60</td>
+</tr>
+<tr>
+<td>High-level design</td>
+<td>The main deliverable; interviewer probes basics of each box</td>
+<td>Speed through it to bank time</td>
+<td>Breeze past; assumed</td>
+</tr>
+<tr>
+<td>Deep dives</td>
+<td>Knows a spatial index is needed (specific choice optional); at least the DB-status locking solution</td>
+<td>≥2 dives in real detail with articulated tradeoffs; comfortable with distributed locking and sharding strategy</td>
+<td>Proactively drives ≥3 dives; interviewer redirects rather than steers — and ideally learns something</td>
+</tr>
+<tr>
+<td>Who drives</td>
+<td>Shared</td>
+<td>Mostly candidate</td>
+<td>Entirely candidate</td>
+</tr>
+</tbody></table>
+<p>The staff-level bar phrased honestly: the interviewer should walk out having gained a perspective they didn&#39;t have. The &quot;ephemerality licenses simplicity&quot; observation above is exactly the kind of synthesis that clears it.</p>
+<hr>
+<h2 id="quick-recall-card">Quick Recall Card</h2>
+<table>
+<thead>
+<tr>
+<th>Problem</th>
+<th>Answer</th>
+<th>One-line why</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>2M location writes/sec</td>
+<td>Redis GEO (<code>GEOADD</code>/<code>GEOSEARCH</code>, geohash sorted set)</td>
+<td>Latest-value-wins state, not durable data</td>
+</tr>
+<tr>
+<td>Too many pings at all</td>
+<td>Adaptive intervals on the driver client</td>
+<td>The client is free compute; idle drivers don&#39;t need 5s pings</td>
+</tr>
+<tr>
+<td>Driver double-booking</td>
+<td><code>SET driver_lock:{id} NX PX 10000</code></td>
+<td>Datastore owns the deadline; every failure mode = TTL expiry</td>
+</tr>
+<tr>
+<td>Surge without drops</td>
+<td>Geo-partitioned Kafka; offset commit <strong>after</strong> match</td>
+<td>Redelivery on crash for free; scale on consumer lag</td>
+</tr>
+<tr>
+<td>Unresponsive driver</td>
+<td>Temporal workflow (offer → durable 10s timer → next)</td>
+<td>Timeouts that outlive the process; Uber built Cadence for this</td>
+</tr>
+<tr>
+<td>Global scale</td>
+<td>Geo-shard everything + read replicas</td>
+<td>Rides are local; scatter-gather only at boundaries</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>See also:</strong> <a href="/dealing-with-contention/">hld/14-dealing-with-contention</a> for the full escalation ladder this deep dive is one instance of (conditional write → OCC → FOR UPDATE → SERIALIZABLE → lease).</p>
+</blockquote>
+
+  </div>
+  
+</article>
+
+</main>
+<footer class="foot">
+  <p>Kumar Saurav · 2026 · Generated from study notes. Diagrams render with Mermaid; code highlighting by highlight.js.</p>
+</footer>
+</body>
+</html>

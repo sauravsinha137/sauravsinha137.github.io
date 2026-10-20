@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dealing with Contention — Kumar Saurav — Interview Prep Notes</title>
+<meta name="description" content="HLD: Dealing with Contention">
+<link rel="canonical" href="https://sauravsinha137.github.io/dealing-with-contention/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script><script>hljs.highlightAll();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><a class="brand" href="/">Kumar Saurav — Interview Prep Notes</a></header>
+<main id="main">
+<article class="post">
+  <p class="kicker">HLD · advanced <span class="badge">Learning</span></p>
+  <h1>Dealing with Contention</h1>
+  <p class="meta"><time datetime="2026-10-02">2 Oct 2026</time> · 13 min read</p>
+  <figure class="video"><video controls preload="metadata" src="/media/nine-fifty-nine.mp4"></video><figcaption>Nine Fifty-Nine — a 90-second explainer built from this page. <a href="/media/credits.txt">Asset credits</a>.</figcaption></figure>
+  <div class="body">
+<h2 id="0-the-one-sentence">0. The one sentence</h2>
+<p><strong>Every contended resource has exactly one source of truth. Make the contended thing a single addressable cell (row / key / item), then pick the cheapest tool that closes the read→write gap.</strong></p>
+<p>Everything below is a variation of <strong>compare-and-set</strong>: &quot;write this, but only if the thing is still what I think it is.&quot; You already know this from <code>AtomicInteger.compareAndSet()</code> in Java. The database versions are the same idea at a different layer.</p>
+<hr>
+<h2 id="1-the-problem-lost-update">1. The problem: lost update</h2>
+<p>Read-modify-write with a gap in the middle:</p>
+<pre><code>Alice: SELECT seats → 1      Bob: SELECT seats → 1
+Alice: 1 &gt; 0, charge card    Bob: 1 &gt; 0, charge card
+Alice: UPDATE seats = 0
+                             Bob: UPDATE seats = -1   ← lost update, double sale</code></pre>
+<p>The read and the write are two statements. The world changes between them. Microseconds in memory, milliseconds over a network, and that&#39;s enough.</p>
+<p><strong>Interview framing:</strong> &quot;This is a read-modify-write race. The fix is always to make the write conditional on what I read, or to hold the thing still while I decide.&quot; Say this sentence before you pick a tool.</p>
+<hr>
+<h2 id="2-the-escalation-ladder-take-the-first-rung-that-fits">2. The escalation ladder (take the first rung that fits)</h2>
+<table>
+<thead>
+<tr>
+<th>Rung</th>
+<th>Shape of the decision</th>
+<th>Tool</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>&quot;if&quot; about the row I&#39;m writing</td>
+<td><strong>Conditional write</strong> (<code>WHERE</code> predicate)</td>
+<td>lowest</td>
+</tr>
+<tr>
+<td>2</td>
+<td>read → decide in app code → write; collisions <strong>rare</strong></td>
+<td><strong>Optimistic concurrency</strong> (version column)</td>
+<td>retry on conflict</td>
+</tr>
+<tr>
+<td>3</td>
+<td>read → decide in app code → write; collisions <strong>common</strong></td>
+<td><strong>Pessimistic lock</strong> (<code>SELECT ... FOR UPDATE</code>)</td>
+<td>everyone pays lock cost</td>
+</tr>
+<tr>
+<td>4</td>
+<td>invariant spans rows that never collide (write skew)</td>
+<td><strong>SERIALIZABLE</strong> isolation, or materialize onto one row</td>
+<td>abort/retry, tracking overhead</td>
+</tr>
+<tr>
+<td>5</td>
+<td>exclusivity must outlive one transaction (a wait, an external call)</td>
+<td><strong>Distributed lock / lease</strong> (Redis <code>SET NX PX</code>, DB columns, ZK/etcd)</td>
+<td>new infra or extra row contention</td>
+</tr>
+</tbody></table>
+<p>The article orders 2 and 3 as pessimistic-then-optimistic. For interviews the decision rule is the same either way: <strong>how often do writers actually collide?</strong> Rare → optimistic. Common → pessimistic.</p>
+<hr>
+<h2 id="3-rung-1-conditional-writes-sql-spells-cas-as-where">3. Rung 1: Conditional writes (SQL spells CAS as <code>WHERE</code>)</h2>
+<pre><code class="language-sql">UPDATE concerts
+SET available_seats = available_seats - 1
+WHERE concert_id = &#39;weeknd_tour&#39; AND available_seats &gt; 0;</code></pre>
+<p>Safe under concurrency with no explicit lock. The DB serializes updates to the same row. Bob&#39;s statement waits for Alice&#39;s, then re-evaluates <code>available_seats &gt; 0</code> against her result, matches 0 rows.</p>
+<h3 id="gotcha-1-0-rows-updated-is-not-an-error">Gotcha 1: 0 rows updated is NOT an error</h3>
+<p>The statement succeeds silently. If the next statement is an unconditional <code>INSERT INTO tickets</code>, Bob gets a ticket for a seat he never got. Either check the affected-row count in app code and roll back, or chain the insert off the update:</p>
+<pre><code class="language-sql">WITH reservation AS (
+  UPDATE concerts SET available_seats = available_seats - 1
+  WHERE concert_id = &#39;weeknd_tour&#39; AND available_seats &gt; 0
+  RETURNING concert_id
+)
+INSERT INTO tickets (user_id, concert_id, seat_number, purchase_time)
+SELECT &#39;user123&#39;, concert_id, &#39;A15&#39;, NOW() FROM reservation;</code></pre>
+<p>In Java/JPA: <code>int rows = em.createQuery(...).executeUpdate(); if (rows == 0) throw new SoldOutException();</code> inside the <code>@Transactional</code> method so the exception rolls everything back.</p>
+<h3 id="gotcha-2-guard-the-thing-people-actually-fight-over">Gotcha 2: guard the thing people actually fight over</h3>
+<p>A counter guard answers &quot;is <em>a</em> seat left&quot;. It cannot answer &quot;is <em>this</em> seat left&quot;. With 20 seats left, two buyers both decrement successfully and both insert seat A15. The count is correct and the seat is double-sold.</p>
+<p><strong>Fix:</strong> one row per seat, CAS on the seat row:</p>
+<pre><code class="language-sql">UPDATE tickets SET status = &#39;sold&#39;, user_id = &#39;user123&#39;
+WHERE concert_id = &#39;weeknd_tour&#39; AND seat_number = &#39;A15&#39; AND status = &#39;available&#39;;</code></pre>
+<p>The seat count becomes derived data (or a cached counter decremented in the same transaction).</p>
+<blockquote>
+<p><strong>Bar-raiser line:</strong> &quot;The database can only protect a conflict it can see. My first job is to make the contended thing exist as a single row.&quot;</p>
+</blockquote>
+<h3 id="same-move-other-stores">Same move, other stores</h3>
+<p>DynamoDB <code>ConditionExpression</code>, Redis <code>SET NX</code>, Cassandra lightweight transaction (<code>IF</code>), HTTP <code>If-Match</code>, Java <code>AtomicReference.compareAndSet</code>, <code>ConcurrentHashMap.putIfAbsent</code>.</p>
+<hr>
+<h2 id="4-rung-3-pessimistic-locking-select-for-update">4. Rung 3: Pessimistic locking (<code>SELECT ... FOR UPDATE</code>)</h2>
+<p>When the decision can&#39;t be a <code>WHERE</code> predicate. Example: group of 4 wants adjacent seats. App must read the seat map, find a contiguous block, then claim it. Two groups read the same map, both choose A15–A18, second writer clobbers.</p>
+<pre><code class="language-sql">BEGIN;
+SELECT seat_number FROM seats
+WHERE concert_id = &#39;weeknd_tour&#39; AND section = &#39;floor&#39; AND status = &#39;available&#39;
+FOR UPDATE;                      -- locks every returned row until COMMIT
+-- app picks A15-A18
+UPDATE seats SET status = &#39;sold&#39;, user_id = &#39;user123&#39;
+WHERE concert_id = &#39;weeknd_tour&#39; AND seat_number IN (&#39;A15&#39;,&#39;A16&#39;,&#39;A17&#39;,&#39;A18&#39;);
+COMMIT;</code></pre>
+<p>Second group&#39;s <code>SELECT FOR UPDATE</code> blocks until commit, then sees A15–A18 gone.</p>
+<p><strong>Java:</strong> JPA <code>em.find(Seat.class, id, LockModeType.PESSIMISTIC_WRITE)</code> or Spring Data <code>@Lock(LockModeType.PESSIMISTIC_WRITE)</code> on a repository method. Must be inside a transaction or the lock is released immediately.</p>
+<h3 id="failure-modes-interviewers-probe">Failure modes interviewers probe</h3>
+<ol>
+<li><strong>Locking too much, too long.</strong> Table lock = serialize all writers. Lock held across a payment API call = every buyer waits on Stripe&#39;s p99. Rule: no I/O inside the lock. Do external calls before acquiring or after releasing.</li>
+<li><strong>Deadlock from inconsistent ordering.</strong> See §8. Fix: sort lock targets by a deterministic key before acquiring.</li>
+<li><strong>Everyone pays.</strong> Even the 99% of transactions that never collide pay lock overhead. That&#39;s the argument for optimistic when contention is low.</li>
+</ol>
+<hr>
+<h2 id="5-rung-2-optimistic-concurrency-control-occ">5. Rung 2: Optimistic concurrency control (OCC)</h2>
+<p>Assume conflicts are rare. Don&#39;t block. Detect at write time and retry.</p>
+<p>Needs a value on the row that changes on every write. Read it, then write with <code>WHERE version = &lt;what I read&gt;</code>.</p>
+<pre><code class="language-sql">-- Both read: seats=1, version=42
+UPDATE concerts SET available_seats = available_seats - 1, version = version + 1
+WHERE concert_id = &#39;weeknd_tour&#39; AND version = 42;
+-- Alice: 1 row. Bob: 0 rows → re-read + retry, or tell user &quot;sold out&quot;.</code></pre>
+<p>Same gotcha as rung 1: 0 rows is silent. Check the count.</p>
+<p><strong>Java:</strong> JPA <code>@Version private long version;</code> does this automatically. A stale write throws <code>OptimisticLockException</code> (Spring wraps as <code>ObjectOptimisticLockingFailureException</code>). Catch and retry with bounded attempts + jitter. Spring Retry <code>@Retryable(OptimisticLockException.class, maxAttempts = 3)</code> is the idiomatic shape.</p>
+<h3 id="what-can-be-the-quotversionquot">What can be the &quot;version&quot;?</h3>
+<table>
+<thead>
+<tr>
+<th>Candidate</th>
+<th>OK?</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Dedicated int counter, +1 every write</td>
+<td>✅ default</td>
+<td>changes on every write, no ABA</td>
+</tr>
+<tr>
+<td><code>updated_at</code> timestamp</td>
+<td>⚠️</td>
+<td>only if every write touches it and clock resolution is fine enough</td>
+</tr>
+<tr>
+<td>Business value that moves one way (auction high bid)</td>
+<td>✅</td>
+<td>monotonic, so no ABA</td>
+</tr>
+<tr>
+<td>Business value that can round-trip (balance, review_count)</td>
+<td>❌</td>
+<td><strong>ABA problem</strong>, see §8</td>
+</tr>
+<tr>
+<td>Postgres <code>xmin</code> system column</td>
+<td>✅</td>
+<td>built-in row version</td>
+</tr>
+</tbody></table>
+<h3 id="pessimistic-vs-optimistic-the-decision">Pessimistic vs optimistic: the decision</h3>
+<p>&quot;How often do writers actually collide?&quot; Collisions common → lock up front, retries cost more than the lock. Collisions rare (most e-commerce) → optimistic, eat the occasional retry. Under hot contention OCC degrades badly: retry storms, wasted work.</p>
+<hr>
+<h2 id="6-rung-4-write-skew-and-isolation-levels">6. Rung 4: Write skew and isolation levels</h2>
+<p>All three tools above protect <strong>rows both transactions touch</strong>. Write skew is when they don&#39;t.</p>
+<p><strong>On-call example:</strong> rule = at least one engineer on call. Alice and Bob both on call. Both step down at once. Alice reads &quot;Bob is on&quot; → removes herself. Bob reads &quot;Alice is on&quot; → removes himself. Each writes its own row. Both commit. Nobody on call. No shared row, so no <code>WHERE</code>, no <code>FOR UPDATE</code>, no version catches it. The conflict is in what each <strong>read</strong> to decide.</p>
+<h3 id="isolation-levels-options-not-a-ladder">Isolation levels (options, not a ladder)</h3>
+<table>
+<thead>
+<tr>
+<th>Level</th>
+<th>Sees</th>
+<th>Default in</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>READ UNCOMMITTED</td>
+<td>dirty reads</td>
+<td>rarely used</td>
+</tr>
+<tr>
+<td>READ COMMITTED</td>
+<td>only committed data, each statement a fresh snapshot</td>
+<td><strong>PostgreSQL</strong></td>
+</tr>
+<tr>
+<td>REPEATABLE READ</td>
+<td>snapshot fixed for the whole transaction</td>
+<td><strong>MySQL/InnoDB</strong></td>
+</tr>
+<tr>
+<td>SERIALIZABLE</td>
+<td>result equals <em>some</em> serial order; DB tracks read-write dependencies</td>
+<td>nobody by default</td>
+</tr>
+</tbody></table>
+<p><strong>Only SERIALIZABLE catches write skew.</strong> REPEATABLE READ does not. Under SERIALIZABLE one of Alice/Bob aborts with a serialization error, app retries, retry sees the new state and backs off.</p>
+<pre><code class="language-sql">BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM on_call WHERE team_id = &#39;payments&#39; AND is_active = true;  -- 2
+UPDATE on_call SET is_active = false WHERE engineer_id = &#39;alice&#39;;
+COMMIT;  -- may abort with serialization_failure → retry</code></pre>
+<p><strong>Java:</strong> <code>@Transactional(isolation = Isolation.SERIALIZABLE)</code>; catch <code>CannotSerializeTransactionException</code> and retry.</p>
+<h3 id="cost-and-the-cheaper-alternative">Cost and the cheaper alternative</h3>
+<p>SERIALIZABLE tracks every read/write, aborts throw away work. Most NoSQL stores don&#39;t offer it at all. So the preferred move is to <strong>materialize the invariant onto one row</strong>: a <code>team.on_call_count</code> column you decrement with <code>WHERE on_call_count &gt; 1</code>, or <code>SELECT ... FOR UPDATE</code> on the team row before anyone steps down. That turns cross-row skew back into same-row contention that rung 1 or 3 handles cheaply. Same lesson as &quot;one row per seat.&quot;</p>
+<hr>
+<h2 id="7-rung-5-distributed-locks-leases">7. Rung 5: Distributed locks (leases)</h2>
+<p>Every tool above lives inside one DB transaction. A DB lock dies with its transaction. Sometimes exclusivity has to span a <strong>wait</strong> or an <strong>external call</strong>: Ticketmaster holds seat A15 for 10 minutes while you type card details. <code>FOR UPDATE</code> can&#39;t do that (pins a connection for 10 min, invisible to other app servers).</p>
+<p>Fix: stop holding the lock as a transaction, hold it as <strong>data</strong>: who holds it, and when the hold expires. Any server can read it. It outlives any transaction.</p>
+<table>
+<thead>
+<tr>
+<th>Where the lease lives</th>
+<th>How</th>
+<th>Pro</th>
+<th>Con</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Redis</strong></td>
+<td><code>SET seat:A15 user123 NX PX 600000</code></td>
+<td>fast, TTL = automatic cleanup, any server sees it</td>
+<td>not airtight: holder stalls past TTL (GC pause) → two holders briefly. Fine for soft holds, not for money. Redis itself is a SPOF</td>
+</tr>
+<tr>
+<td><strong>DB columns</strong></td>
+<td><code>UPDATE seats SET reserved_by=?, reserved_until=NOW()+10min WHERE seat_id=? AND (reserved_until IS NULL OR reserved_until &lt; NOW())</code></td>
+<td>no new infra, same consistency as your data, expiry in the WHERE = no cleanup job</td>
+<td>slower than cache, lock row becomes a hot spot</td>
+</tr>
+<tr>
+<td><strong>ZooKeeper / etcd</strong></td>
+<td>ephemeral node / lease via ZAB / Raft</td>
+<td>survives partitions and leader failure, auto-release on client session death</td>
+<td>you run a consensus cluster</td>
+</tr>
+</tbody></table>
+<p><strong><code>NX</code> is non-negotiable.</strong> Without it a second <code>SET</code> overwrites the first holder&#39;s lock.</p>
+<p><strong>Release safely:</strong> store a unique token as the value, and release with a Lua script &quot;DEL only if value == my token&quot;. Otherwise a slow holder whose TTL expired can delete <em>someone else&#39;s</em> lock. Redisson <code>RLock</code> does this for you (plus a watchdog that extends TTL while the holder is alive).</p>
+<p><strong>UX win, not just correctness:</strong> the hold shrinks the fight window from &quot;entire checkout&quot; to &quot;the instant of selection&quot;. Nobody fills out payment then gets &quot;seat gone&quot;.</p>
+<p>Cross-ref: <a href="/design-uber/">design-uber § Deep Dive 3</a> uses exactly this for driver offers: <code>SET driver_lock:8842 ride:xyz NX PX 10000</code>.</p>
+<hr>
+<h2 id="8-common-deep-dives-be-ready-to-whiteboard-each">8. Common deep dives (be ready to whiteboard each)</h2>
+<h3 id="quothow-do-you-prevent-deadlocks-with-pessimistic-lockingquot">&quot;How do you prevent deadlocks with pessimistic locking?&quot;</h3>
+<p>Transfer A→B and B→A simultaneously. T1 locks Alice then wants Bob. T2 locks Bob then wants Alice. Cycle.</p>
+<p><strong>Ordered locking:</strong> sort all participants by a global key (primary key) before acquiring. Transfer between 456 and 123 <strong>always</strong> locks 123 first, regardless of who initiated. &quot;Lock the initiator first&quot; is <strong>wrong</strong>, it&#39;s not globally consistent.</p>
+<p>Even with ordering, handle deadlock as a retryable error. Every major DB runs deadlock detection by default and kills one victim. Catch (<code>DeadlockLoserDataAccessException</code> in Spring), retry with locks taken in order. Lock-wait timeout is a different, coarser backstop for &quot;someone held a lock too long&quot;, not a cycle.</p>
+<p>Same as Java&#39;s lock-ordering rule from <a href="/concurrency/">java/02-concurrency</a>: <code>synchronized(min(a,b)) { synchronized(max(a,b)) {...} }</code>.</p>
+<h3 id="quotwhat-is-the-aba-problem-with-occquot">&quot;What is the ABA problem with OCC?&quot;</h3>
+<p>Reuse <code>review_count</code> as the version. Read 100. A review is deleted (99), a new one lands (100). Your <code>WHERE review_count = 100</code> passes and clobbers the intervening update. Equality can&#39;t see the round trip.</p>
+<p>Fix: dedicated monotonic version column, incremented on <strong>every</strong> write even if no business field changed. Fallback without a column: put every field you read into the <code>WHERE</code>. Or use Postgres <code>xmin</code>. (Java analogue: <code>AtomicStampedReference</code>.)</p>
+<h3 id="quoteveryone-wants-the-same-row-now-whatquot">&quot;Everyone wants the same row. Now what?&quot;</h3>
+<p>Hot key / celebrity problem. Sharding doesn&#39;t help (one row). Load balancing doesn&#39;t help (servers queue on the same row). Read replicas don&#39;t help (the fight is over writes).</p>
+<ol>
+<li><strong>Change the problem first.</strong> 10 identical items → 10 separate auctions. Likes/follows → eventually consistent, nobody notices a 2-second lag on a follower count.</li>
+<li><strong>Queue-based serialization.</strong> All writes for that key go to one partition of a queue, consumed by a single worker. Contention becomes sequencing. Queue absorbs the spike. Trade-off: throughput capped at one worker, and that worker is a SPOF you back with a standby. Partition key = the contended resource so ordering holds.</li>
+</ol>
+<h3 id="quotwhy-not-just-use-a-distributed-lock-for-everythingquot">&quot;Why not just use a distributed lock for everything?&quot;</h3>
+<p>Because it adds a component, a network hop, and a new failure mode (TTL expiry under GC pause, Redis outage) to solve something a <code>WHERE</code> clause already solves. Interviewers mark this down. Default to the single DB. Escalate only when the hold must span a wait/external call.</p>
+<hr>
+<h2 id="9-scope-boundary-say-this-out-loud">9. Scope boundary (say this out loud)</h2>
+<p>Everything here assumes <strong>one authoritative store</strong> for the contended resource. Two cases leave this pattern entirely:</p>
+<ul>
+<li><strong>One operation must atomically span multiple shards/services</strong> (transfer between accounts on different shards) → distributed transaction / saga / outbox. Different pattern.</li>
+<li><strong>Same record writable in multiple places</strong> (multi-leader / leaderless replication) → conflict resolution: LWW, vector clocks, CRDTs. Replication topic, see 07-cap-theorem-consistency.</li>
+</ul>
+<p>Nine times out of ten you can keep it in one DB. Do that.</p>
+<hr>
+<h2 id="10-interview-recognition-signals-and-canned-openers">10. Interview recognition signals and canned openers</h2>
+<p><strong>Recognize:</strong> limited inventory (tickets, flash sale, auction), double-booking (meeting rooms, drivers, seats), balance updates, &quot;what if two users do X at the same time&quot;. Flag it yourself during NFRs under &quot;strong consistency&quot;. Don&#39;t wait to be asked.</p>
+<table>
+<thead>
+<tr>
+<th>Problem</th>
+<th>Tool</th>
+<th>Opener</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Auction</td>
+<td>OCC with high bid as version (monotonic, no ABA)</td>
+<td>&quot;Bidders contend on one item, bids only go up, so I&#39;ll CAS on the current high bid.&quot;</td>
+</tr>
+<tr>
+<td>Ticketmaster</td>
+<td>Reservation lease (10-min TTL) + CAS on seat row at purchase</td>
+<td>&quot;The real win is the hold at selection time, so nobody pays and then loses the seat.&quot;</td>
+</tr>
+<tr>
+<td>Flash sale</td>
+<td>OCC with version column on inventory + cart hold with TTL</td>
+<td>&quot;Inventory is a hot row, I&#39;ll consider queue serialization if contention is extreme.&quot;</td>
+</tr>
+<tr>
+<td>Uber dispatch</td>
+<td>Driver status lease, Redis <code>SET NX PX 10000</code></td>
+<td>&quot;One driver, one outstanding offer, expiry owned by the store not my process.&quot;</td>
+</tr>
+<tr>
+<td>Yelp rating update</td>
+<td>OCC with dedicated version column (review_count has ABA)</td>
+<td></td>
+</tr>
+<tr>
+<td>Banking within one DB</td>
+<td>Pessimistic with ordered locking, or OCC</td>
+<td>&quot;Cross-shard transfers leave this pattern and become a distributed transaction.&quot;</td>
+</tr>
+</tbody></table>
+<p><strong>Don&#39;t overcomplicate:</strong> admin-only edits → OCC + retry. Single-user data → no coordination. Read-heavy → OCC.</p>
+<hr>
+<h2 id="11-one-liner-arsenal">11. One-liner arsenal</h2>
+<ul>
+<li>&quot;A lost update is a read-modify-write with a gap. Every fix either makes the write conditional or holds the row still.&quot;</li>
+<li>&quot;<code>WHERE</code> is how SQL spells compare-and-set.&quot;</li>
+<li>&quot;Zero rows updated is a success, not an error. Check the count or chain the insert.&quot;</li>
+<li>&quot;The guard must sit on the thing people are fighting over. A counter can&#39;t tell two buyers of A15 apart.&quot;</li>
+<li>&quot;Pessimistic when collisions are common, optimistic when rare. The question is collision rate.&quot;</li>
+<li>&quot;Write skew has no shared row. Only SERIALIZABLE sees it, or I materialize the invariant onto one row.&quot;</li>
+<li>&quot;A DB lock dies with its transaction. A lease is a lock held as data.&quot;</li>
+<li>&quot;Redis NX without a fencing token is a soft lock. Fine for seat holds, not for money.&quot;</li>
+<li>&quot;Hot key: change the problem first, then serialize through one queue partition.&quot;</li>
+<li>&quot;Cross-shard atomicity isn&#39;t contention, it&#39;s a distributed transaction.&quot;</li>
+</ul>
+<hr>
+
+  </div>
+  <nav class="related"><h2>Related posts</h2><ul><li><a href="/design-uber/">HLD Problem: Design Uber</a></li><li><a href="/concurrency/">Java Concurrency</a></li></ul></nav>
+</article>
+
+</main>
+<footer class="foot">
+  <p>Kumar Saurav · 2026 · Generated from study notes. Diagrams render with Mermaid; code highlighting by highlight.js.</p>
+</footer>
+</body>
+</html>

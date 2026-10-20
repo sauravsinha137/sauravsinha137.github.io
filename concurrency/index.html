@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Java Concurrency — Kumar Saurav — Interview Prep Notes</title>
+<meta name="description" content="Java: Java Concurrency">
+<link rel="canonical" href="https://sauravsinha137.github.io/concurrency/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script><script>hljs.highlightAll();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><a class="brand" href="/">Kumar Saurav — Interview Prep Notes</a></header>
+<main id="main">
+<article class="post">
+  <p class="kicker">Java · advanced <span class="badge">Learning</span></p>
+  <h1>Java Concurrency</h1>
+  <p class="meta"><time datetime="2026-04-05">5 Apr 2026</time> · 8 min read</p>
+  
+  <div class="body">
+<p><strong>Status:</strong> Taught on 2026-04-05</p>
+<h2 id="concept-summary">Concept Summary</h2>
+<p>Java concurrency covers thread lifecycle, synchronization mechanisms, the Java Memory Model (JMM), executor framework, and concurrent utilities. You must be able to write thread-safe code and explain WHY it&#39;s safe.</p>
+<h2 id="chapter-1-threads">Chapter 1: Threads</h2>
+<h3 id="creating-threads">Creating Threads</h3>
+<ul>
+<li><strong>Extend Thread:</strong> <code>class MyThread extends Thread</code> — limits you to single inheritance</li>
+<li><strong>Implement Runnable (preferred):</strong> <code>new Thread(() -&gt; ...)</code> — separates task from mechanism</li>
+<li><strong>Callable<V>:</strong> Like Runnable but returns a result and can throw checked exceptions. Used with ExecutorService.</li>
+</ul>
+<h3 id="start-vs-run">start() vs run()</h3>
+<ul>
+<li><code>t.start()</code> — creates a NEW OS thread, then calls run() on it</li>
+<li><code>t.run()</code> — just a normal method call on the CURRENT thread. No new thread.</li>
+<li><code>start()</code> can only be called once. Second call throws <code>IllegalThreadStateException</code>.</li>
+</ul>
+<h3 id="thread-states">Thread States</h3>
+<pre><code>NEW → RUNNABLE → TERMINATED
+         ↕
+    BLOCKED (waiting for synchronized lock)
+    WAITING (wait(), join(), park())
+    TIMED_WAITING (sleep(), wait(timeout), join(timeout))</code></pre>
+<hr>
+<h2 id="chapter-2-the-shared-memory-problem">Chapter 2: The Shared Memory Problem</h2>
+<h3 id="two-fundamental-problems">Two Fundamental Problems</h3>
+<p><strong>Visibility:</strong> Thread A writes, Thread B doesn&#39;t see it (CPU cache isolation).
+<strong>Atomicity:</strong> Multi-step operation interrupted halfway (read-modify-write race).</p>
+<p><code>count++</code> is THREE operations: READ → ADD → WRITE. Two threads interleaving → lost updates.</p>
+<p>Every concurrency tool solves one or both of these.</p>
+<hr>
+<h2 id="chapter-3-synchronized">Chapter 3: synchronized</h2>
+<p>Acquires the object&#39;s intrinsic monitor lock. Solves BOTH visibility and atomicity.</p>
+<h3 id="three-forms">Three Forms</h3>
+<ol>
+<li><strong>Synchronized block:</strong> <code>synchronized (lockObject) { }</code> — most flexible, you choose the lock</li>
+<li><strong>Synchronized instance method:</strong> <code>public synchronized void m()</code> — locks on <code>this</code></li>
+<li><strong>Synchronized static method:</strong> <code>public static synchronized void m()</code> — locks on <code>MyClass.class</code></li>
+</ol>
+<p><strong>Critical:</strong> Instance method locks <code>this</code>, static method locks <code>MyClass.class</code>. They are DIFFERENT locks. One does NOT block the other.</p>
+<h3 id="reentrancy">Reentrancy</h3>
+<p>Same thread can acquire the same lock multiple times. Without this, a synchronized method calling another synchronized method on the same object would deadlock.</p>
+<h3 id="what-it-guarantees">What It Guarantees</h3>
+<ul>
+<li><strong>Atomicity:</strong> One thread at a time inside the block</li>
+<li><strong>Visibility:</strong> On exit, writes flush to main memory. On entry, reads come from main memory. (Happens-before relationship)</li>
+</ul>
+<h3 id="locking-on-this-can-be-too-broad">Locking on <code>this</code> Can Be Too Broad</h3>
+<p>If an object has 5 synchronized methods protecting different data, they all compete for the same lock. Use dedicated lock objects for fine-grained locking:</p>
+<pre><code class="language-java">private final Object countLock = new Object();
+private final Object nameLock = new Object();</code></pre>
+<hr>
+<h2 id="chapter-4-volatile">Chapter 4: volatile</h2>
+<p>Solves visibility. Does NOT solve atomicity.</p>
+<h3 id="what-it-guarantees">What It Guarantees</h3>
+<p>Every volatile write goes to main memory immediately. Every volatile read comes from main memory. No CPU cache staleness.</p>
+<h3 id="what-it-does-not-guarantee">What It Does NOT Guarantee</h3>
+<p><code>volatile int count; count++</code> is NOT thread-safe. Still three operations (read, add, write) that can be interleaved.</p>
+<h3 id="when-to-use">When to Use</h3>
+<ul>
+<li>Simple flags: <code>volatile boolean running = true</code></li>
+<li>Publishing immutable object references: <code>volatile Config config = loadConfig()</code></li>
+<li>NOT for compound operations (check-then-act, read-modify-write)</li>
+</ul>
+<hr>
+<h2 id="chapter-5-wait-notify-notifyall">Chapter 5: wait(), notify(), notifyAll()</h2>
+<p>Low-level thread communication. Used inside synchronized blocks.</p>
+<h3 id="critical-rules">Critical Rules</h3>
+<ol>
+<li><strong>Must be inside synchronized.</strong> <code>wait()</code> releases the lock. No lock held = IllegalMonitorStateException.</li>
+<li><strong><code>wait()</code> releases the lock. <code>sleep()</code> does NOT.</strong> Key interview question.</li>
+<li><strong>Always <code>while</code>, not <code>if</code>, around <code>wait()</code>.</strong> Spurious wakeups can happen — condition might still be false after waking.</li>
+<li><strong>Prefer <code>notifyAll()</code> over <code>notify()</code>.</strong> <code>notify()</code> wakes one random thread. If the wrong one wakes, nobody makes progress.</li>
+</ol>
+<h3 id="sleep-vs-wait">sleep() vs wait()</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>wait()</th>
+<th>sleep()</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Releases lock?</td>
+<td>YES</td>
+<td>NO</td>
+</tr>
+<tr>
+<td>Must be in synchronized?</td>
+<td>YES</td>
+<td>NO</td>
+</tr>
+<tr>
+<td>Woken by</td>
+<td>notify()/notifyAll()</td>
+<td>Timeout</td>
+</tr>
+<tr>
+<td>Purpose</td>
+<td>Thread coordination</td>
+<td>Just pausing</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="chapter-6-reentrantlock">Chapter 6: ReentrantLock</h2>
+<p>Explicit lock with features synchronized lacks.</p>
+<h3 id="advantages-over-synchronized">Advantages Over synchronized</h3>
+<ul>
+<li><code>tryLock()</code> — non-blocking attempt</li>
+<li><code>tryLock(timeout)</code> — attempt with timeout</li>
+<li><code>lockInterruptibly()</code> — can be interrupted while waiting</li>
+<li><code>ReadWriteLock</code> — readers don&#39;t block readers</li>
+<li>Multiple <code>Condition</code> objects (vs one wait/notify set)</li>
+<li>Fairness option</li>
+</ul>
+<h3 id="always-unlock-in-finally">Always Unlock in finally</h3>
+<pre><code class="language-java">lock.lock();
+try {
+    // critical section
+} finally {
+    lock.unlock();  // MUST unlock — otherwise lock leaks on exception
+}</code></pre>
+<h3 id="readwritelock">ReadWriteLock</h3>
+<ul>
+<li>Reader + Reader → both proceed</li>
+<li>Reader + Writer → writer waits</li>
+<li>Writer + Writer → one waits</li>
+<li>Huge throughput gain for read-heavy workloads (90%+ reads)</li>
+</ul>
+<h3 id="when-to-use-which">When to Use Which</h3>
+<p>Default: synchronized (simpler, fewer bugs). Use ReentrantLock only when you need tryLock, timeout, interruptibility, or ReadWriteLock.</p>
+<hr>
+<h2 id="chapter-7-java-memory-model-jmm">Chapter 7: Java Memory Model (JMM)</h2>
+<h3 id="happens-before-rules">Happens-Before Rules</h3>
+<p>&quot;A happens-before B&quot; means everything Thread A did before point A is guaranteed visible to Thread B after point B.</p>
+<ol>
+<li><strong>Program order:</strong> Within one thread, each statement happens-before the next.</li>
+<li><strong>Monitor lock:</strong> Unlock happens-before subsequent lock of same monitor.</li>
+<li><strong>Volatile:</strong> Volatile write happens-before subsequent volatile read of same variable. Also acts as a memory fence — ALL writes before the volatile write are visible after the volatile read.</li>
+<li><strong>Thread start:</strong> <code>thread.start()</code> happens-before any action in the started thread.</li>
+<li><strong>Thread join:</strong> All actions in a thread happen-before <code>join()</code> returns.</li>
+<li><strong>Transitivity:</strong> If A→B and B→C, then A→C.</li>
+</ol>
+<hr>
+<h2 id="chapter-8-executors-thread-pools">Chapter 8: Executors — Thread Pools</h2>
+<h3 id="why-thread-pools">Why Thread Pools</h3>
+<p>Creating new Thread per task is expensive (OS thread creation). Thread pools reuse threads.</p>
+<h3 id="pool-types">Pool Types</h3>
+<ul>
+<li><code>newFixedThreadPool(n)</code> — exactly n threads, unbounded queue</li>
+<li><code>newCachedThreadPool()</code> — creates threads as needed, reuses idle ones</li>
+<li><code>newSingleThreadExecutor()</code> — one thread, sequential execution</li>
+<li><code>newScheduledThreadPool(n)</code> — delayed and periodic tasks</li>
+</ul>
+<h3 id="threadpoolexecutor-internals">ThreadPoolExecutor Internals</h3>
+<pre><code>Task arrives:
+1. Threads &lt; corePoolSize → create new thread
+2. Threads &gt;= corePoolSize → put in queue
+3. Queue full AND threads &lt; maxPoolSize → create new thread
+4. Queue full AND threads &gt;= maxPoolSize → rejection policy</code></pre>
+<p>Rejection policies: AbortPolicy (throws), CallerRunsPolicy (caller runs it), DiscardPolicy (silent drop), DiscardOldestPolicy (drop oldest, retry).</p>
+<p><strong>Interview trap:</strong> <code>newFixedThreadPool</code> uses unbounded <code>LinkedBlockingQueue</code>. Tasks queue forever → can OOM. Production code uses bounded queues.</p>
+<h3 id="shutdown">Shutdown</h3>
+<ul>
+<li><code>shutdown()</code> — stop accepting, finish running tasks</li>
+<li><code>shutdownNow()</code> — interrupt running tasks</li>
+<li>Always shut down or JVM won&#39;t exit (pool threads keep it alive)</li>
+</ul>
+<h3 id="submitting-tasks">Submitting Tasks</h3>
+<ul>
+<li><code>execute(Runnable)</code> — fire and forget</li>
+<li><code>submit(Callable)</code> — returns <code>Future&lt;V&gt;</code>, call <code>future.get()</code> to block for result</li>
+</ul>
+<hr>
+<h2 id="chapter-9-concurrent-utilities">Chapter 9: Concurrent Utilities</h2>
+<h3 id="atomicintegerlongreference">AtomicInteger/Long/Reference</h3>
+<p>Lock-free thread-safe operations via CAS (compare-and-swap).</p>
+<ul>
+<li><code>incrementAndGet()</code>, <code>getAndIncrement()</code></li>
+<li><code>compareAndSet(expected, new)</code> — atomic check-and-update</li>
+<li>No lock, no blocking. CAS fails → automatic retry.</li>
+</ul>
+<h3 id="countdownlatch-quotwait-for-n-things-to-finishquot">CountDownLatch — &quot;Wait for N things to finish&quot;</h3>
+<ul>
+<li><code>new CountDownLatch(3)</code> — count starts at 3</li>
+<li>Workers call <code>countDown()</code> — decrements count</li>
+<li>Main thread calls <code>await()</code> — blocks until count hits 0</li>
+<li><strong>One-time use.</strong> Cannot reset.</li>
+<li>Use case: &quot;Start server after all 3 subsystems initialize&quot;</li>
+</ul>
+<h3 id="cyclicbarrier-quotwait-for-each-other-then-go-togetherquot">CyclicBarrier — &quot;Wait for each other, then go together&quot;</h3>
+<ul>
+<li>All N threads call <code>await()</code> at the checkpoint</li>
+<li>When all arrive, all proceed simultaneously</li>
+<li><strong>Reusable</strong> — resets automatically after each use</li>
+<li>Use case: multi-phase simulation</li>
+</ul>
+<h3 id="countdownlatch-vs-cyclicbarrier">CountDownLatch vs CyclicBarrier</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>CountDownLatch</th>
+<th>CyclicBarrier</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Reusable?</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Who waits?</td>
+<td>One thread for N</td>
+<td>All N for each other</td>
+</tr>
+<tr>
+<td>Use case</td>
+<td>Wait for tasks</td>
+<td>Synchronize at checkpoints</td>
+</tr>
+</tbody></table>
+<h3 id="semaphore-quotonly-n-at-a-timequot">Semaphore — &quot;Only N at a time&quot;</h3>
+<ul>
+<li><code>new Semaphore(3)</code> — 3 permits</li>
+<li><code>acquire()</code> — take permit (blocks if none)</li>
+<li><code>release()</code> — return permit</li>
+<li>Use case: rate-limit access (e.g., max 3 DB connections)</li>
+</ul>
+<h3 id="blockingqueue-thread-safe-queue">BlockingQueue — Thread-Safe Queue</h3>
+<ul>
+<li><code>put()</code> — blocks if full (producer waits)</li>
+<li><code>take()</code> — blocks if empty (consumer waits)</li>
+<li>Types: ArrayBlockingQueue (bounded), LinkedBlockingQueue (optionally bounded), SynchronousQueue (zero capacity, direct handoff)</li>
+<li>Replaces manual wait/notify for producer-consumer</li>
+<li><strong>Poison pill pattern:</strong> send special value to signal consumers to stop. One pill per consumer.</li>
+</ul>
+<hr>
+<h2 id="chapter-10-deadlock">Chapter 10: Deadlock</h2>
+<p>Two threads each hold a lock the other needs. Neither can proceed.</p>
+<h3 id="four-conditions-all-must-hold">Four Conditions (ALL must hold)</h3>
+<ol>
+<li>Mutual exclusion — only one thread holds the lock</li>
+<li>Hold and wait — holds one lock while waiting for another</li>
+<li>No preemption — can&#39;t force lock release</li>
+<li>Circular wait — A waits for B, B waits for A</li>
+</ol>
+<h3 id="prevention-break-any-one-condition">Prevention — Break Any One Condition</h3>
+<ul>
+<li><strong>Lock ordering:</strong> Always acquire locks in same order. No cycle possible.</li>
+<li><strong>tryLock:</strong> If can&#39;t get second lock, release first and retry. Breaks hold-and-wait.</li>
+<li><strong>Timeout:</strong> <code>tryLock(5, SECONDS)</code> — give up after timeout.</li>
+</ul>
+<hr>
+<h2 id="code-examples">Code Examples</h2>
+<ul>
+<li>the project source — BlockingQueue producer-consumer with poison pill</li>
+<li>the project source — Deadlock demo with BLOCKED state detection</li>
+<li>the project source — AtomicInteger counter with 5 threads (user-written)</li>
+<li>the project source — HashMap implementation (from collections session)</li>
+<li>the project source — ConcurrentHashMap with per-bucket locking (from collections session)</li>
+</ul>
+<h2 id="common-interview-questions">Common Interview Questions</h2>
+<ol>
+<li>start() vs run() — what&#39;s the difference?</li>
+<li>What does volatile guarantee? What doesn&#39;t it?</li>
+<li>Is <code>volatile int count; count++</code> thread-safe? Why not?</li>
+<li>sleep() vs wait() — key differences?</li>
+<li>Why always <code>while</code> not <code>if</code> around wait()?</li>
+<li>synchronized instance method vs static method — same lock?</li>
+<li>Implement producer-consumer with BlockingQueue</li>
+<li>Write code that deadlocks. How to prevent?</li>
+<li>Difference between CountDownLatch and CyclicBarrier?</li>
+<li>What is happens-before? Name the rules.</li>
+<li>synchronized vs ReentrantLock — when to use which?</li>
+<li>How does ThreadPoolExecutor decide what to do with a new task?</li>
+<li>What happens if you never call shutdown() on an ExecutorService?</li>
+</ol>
+<h2 id="gotchas">Gotchas</h2>
+<ul>
+<li><code>volatile</code> does NOT make compound operations atomic</li>
+<li><code>synchronized</code> on different objects = no mutual exclusion</li>
+<li>Instance and static synchronized methods use DIFFERENT locks</li>
+<li><code>Thread.sleep()</code> does NOT release locks. <code>wait()</code> DOES.</li>
+<li><code>notify()</code> can wake the wrong thread. Prefer <code>notifyAll()</code>.</li>
+<li>Spurious wakeups are real. Always use while-loop around wait().</li>
+<li><code>newFixedThreadPool</code> has unbounded queue — can OOM in production.</li>
+<li>Never call <code>thread.stop()</code> — use flags or interruption for graceful shutdown.</li>
+<li>Deadlock requires ALL four conditions. Break any one to prevent.</li>
+</ul>
+<h2 id="references">References</h2>
+<ul>
+<li>Java Concurrency in Practice (Goetz) — the definitive reference</li>
+<li>Effective Java (Bloch) — Chapter 11</li>
+<li>JLS Chapter 17 — Java Memory Model</li>
+</ul>
+
+  </div>
+  
+</article>
+
+</main>
+<footer class="foot">
+  <p>Kumar Saurav · 2026 · Generated from study notes. Diagrams render with Mermaid; code highlighting by highlight.js.</p>
+</footer>
+</body>
+</html>

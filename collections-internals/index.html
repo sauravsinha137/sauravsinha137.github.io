@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Collections Internals — Kumar Saurav — Interview Prep Notes</title>
+<meta name="description" content="Java: Collections Internals">
+<link rel="canonical" href="https://sauravsinha137.github.io/collections-internals/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/site.css">
+
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><a class="brand" href="/">Kumar Saurav — Interview Prep Notes</a></header>
+<main id="main">
+<article class="post">
+  <p class="kicker">Java · intermediate <span class="badge">Learning</span></p>
+  <h1>Collections Internals</h1>
+  <p class="meta"><time datetime="2026-04-05">5 Apr 2026</time> · 7 min read</p>
+  
+  <div class="body">
+<p><strong>Status:</strong> Taught on 2026-04-05</p>
+<h2 id="concept-summary">Concept Summary</h2>
+<p>Java Collections Framework internals — how HashMap, ConcurrentHashMap, TreeMap, ArrayList, and LinkedList actually work under the hood. FAANG interviewers expect you to explain hashing, bucket structure, collision resolution, resizing, and thread-safety mechanisms — not just API usage.</p>
+<h2 id="hashmap-internals">HashMap Internals</h2>
+<h3 id="structure">Structure</h3>
+<ul>
+<li>Backed by array of <code>Node&lt;K,V&gt;</code> (buckets). Default capacity 16, load factor 0.75.</li>
+<li>Each bucket holds a linked list of nodes (or a red-black tree if chain gets long).</li>
+</ul>
+<h3 id="how-putkey-value-works">How <code>put(key, value)</code> Works</h3>
+<ol>
+<li><strong>Hash the key:</strong> <code>h = key.hashCode() ^ (key.hashCode() &gt;&gt;&gt; 16)</code><ul>
+<li><code>&gt;&gt;&gt; 16</code>: unsigned right shift — slides upper 16 bits down to lower 16, fills left with zeros</li>
+<li><code>^</code> (XOR): combines both halves so lower bits carry information from all 32 bits</li>
+<li>Why: bucket index uses only lower bits (<code>hash &amp; (capacity-1)</code>), so without this spreading, upper bits are wasted</li>
+</ul>
+</li>
+<li><strong>Find bucket:</strong> <code>index = hash &amp; (capacity - 1)</code> — bitwise AND, works because capacity is power of 2</li>
+<li><strong>Check for existing key:</strong> walk the chain, compare <code>hash</code> then <code>equals()</code>. If found, replace value.</li>
+<li><strong>Insert:</strong> if key not found, add new node at head of chain.</li>
+<li><strong>Resize check:</strong> if <code>size &gt; capacity * loadFactor</code>, double the array and rehash everything.</li>
+</ol>
+<h3 id="hash-function-deep-dive">Hash Function Deep Dive</h3>
+<ul>
+<li><code>hashCode()</code> returns a 32-bit int. The hash doesn&#39;t know the table size.</li>
+<li>Table could be 16 buckets (uses 4 bits) or 65536 buckets (uses 16 bits).</li>
+<li><code>h ^ (h &gt;&gt;&gt; 16)</code> folds upper bits into lower bits so ALL bits contribute to bucket index.</li>
+<li>Without this, keys with same lower bits but different upper bits would always collide.</li>
+<li>Analogy: Aadhaar number (12 digits) assigned to room (1 digit). You want all 12 digits to influence the room assignment.</li>
+</ul>
+<h3 id="bit-operations-reference">Bit Operations Reference</h3>
+<ul>
+<li><code>&gt;&gt;&gt;</code> (unsigned right shift): slides bits right, fills left with zeros ALWAYS. Unlike <code>&gt;&gt;</code> which fills with the sign bit (1s for negative numbers).</li>
+<li><code>^</code> (XOR): outputs 1 when bits are DIFFERENT, 0 when SAME. Unbiased — preserves info from both inputs. XOR with 0 changes nothing (identity). XOR is reversible.</li>
+<li><code>&amp;</code> (AND): outputs 1 only when BOTH bits are 1. Used for bucket index because <code>hash &amp; (n-1)</code> extracts the lower bits.</li>
+</ul>
+<h3 id="treeification-java-8">Treeification (Java 8+)</h3>
+<ul>
+<li>When a bucket&#39;s linked list reaches 8 nodes → converts to red-black tree (O(log n) search).</li>
+<li>When it shrinks to 6 → converts back to linked list (hysteresis prevents thrashing).</li>
+<li>Worst case <code>get()</code>: O(log n) not O(n).</li>
+</ul>
+<h3 id="resizing">Resizing</h3>
+<ul>
+<li>Triggers when <code>size &gt; capacity * loadFactor</code> (default: 12 for initial capacity 16).</li>
+<li>Doubles array size. Rehashes ALL entries — O(n) operation.</li>
+<li>The 13th insert into a default HashMap triggers resize.</li>
+<li>Capacity must be power of 2 — each resize adds one bit to the index mask.</li>
+<li>Performance tip: if you know you&#39;ll have 1000 entries, initialize with <code>new HashMap&lt;&gt;(1334)</code> to avoid resizing.</li>
+</ul>
+<h3 id="thread-safety">Thread Safety</h3>
+<ul>
+<li>HashMap is NOT thread-safe.</li>
+<li>Two threads putting simultaneously → lost updates (one node silently disappears).</li>
+<li>During resize → can create chain cycles → infinite loop in <code>get()</code>.</li>
+</ul>
+<h3 id="null-handling">Null Handling</h3>
+<ul>
+<li>Permits one null key (hashes to bucket 0) and multiple null values.</li>
+<li><code>containsKey()</code> bug: <code>get(key) != null</code> fails if value is null. Must walk chain to check if node exists.</li>
+</ul>
+<hr>
+<h2 id="concurrenthashmap-internals">ConcurrentHashMap Internals</h2>
+<h3 id="why-it-exists">Why It Exists</h3>
+<ul>
+<li><code>Hashtable</code>: one global lock. Thread A reads bucket 5, Thread B waits even though it wants bucket 12.</li>
+<li><code>Collections.synchronizedMap()</code>: same problem — wraps every method in one lock.</li>
+<li><code>ConcurrentHashMap</code>: <strong>one lock per bucket</strong>. Threads on different buckets never block each other.</li>
+</ul>
+<h3 id="three-concurrency-strategies">Three Concurrency Strategies</h3>
+<h4 id="strategy-1-lock-free-reads-get">Strategy 1: Lock-Free Reads (<code>get()</code>)</h4>
+<ul>
+<li><code>get()</code> uses NO locks at all.</li>
+<li>Safe because of <code>volatile</code>:<ul>
+<li><code>table</code> is volatile → threads see the latest array reference</li>
+<li><code>Node.value</code> is volatile → threads see the latest value</li>
+<li><code>Node.next</code> is volatile → threads follow the latest chain</li>
+</ul>
+</li>
+<li>Reads are always fast, never blocked.</li>
+<li>Weakly consistent: may briefly see stale data during concurrent write, but sees it once the write completes.</li>
+<li><code>get()</code> should retry if table was swapped during read (our implementation). Real CHM uses ForwardingNode instead.</li>
+</ul>
+<h4 id="strategy-2-per-bucket-locking-for-writes-put">Strategy 2: Per-Bucket Locking for Writes (<code>put()</code>)</h4>
+<ul>
+<li>Lock ONLY the target bucket. Other buckets remain free.</li>
+<li>With 16 buckets, up to 16 threads can write simultaneously.</li>
+<li>Stale check after acquiring lock: <code>if (tab != table) continue</code> — if resize swapped the table, retry.</li>
+<li>Size increment and resize trigger happen OUTSIDE the bucket lock to avoid deadlock.</li>
+</ul>
+<h4 id="strategy-3-resize">Strategy 3: Resize</h4>
+<ul>
+<li>Lock ALL buckets (in order, to prevent deadlock between resize threads).</li>
+<li>Create NEW nodes in new table — don&#39;t move old ones. Old chains must stay intact for lock-free <code>get()</code>.</li>
+<li>Swap table with volatile write. Waiting <code>put()</code> threads wake up, see stale check fail, retry on new table.</li>
+<li>Only one thread resizes at a time (<code>tryLock()</code> — skip if someone else is already resizing).</li>
+<li>Real CHM uses cooperative resizing: all threads help transfer, ForwardingNode marks transferred buckets.</li>
+</ul>
+<h3 id="why-no-null-keysvalues">Why No Null Keys/Values</h3>
+<ul>
+<li><code>get()</code> returning null is ambiguous: key doesn&#39;t exist OR value is null?</li>
+<li>In HashMap you resolve with <code>containsKey()</code> — safe because single-threaded.</li>
+<li>In ConcurrentHashMap, another thread can modify the map between <code>get()</code> and <code>containsKey()</code>. Two calls are NOT atomic.</li>
+<li>Banning null makes API unambiguous: null from <code>get()</code> = key definitely doesn&#39;t exist.</li>
+</ul>
+<h3 id="atomicreferencearray-vs-volatile-array">AtomicReferenceArray vs volatile Array</h3>
+<ul>
+<li><code>volatile Node[] table</code>: only the REFERENCE is volatile, not individual elements. <code>table[5] = x</code> is NOT a volatile write.</li>
+<li><code>AtomicReferenceArray</code>: each element independently has volatile read/write semantics.</li>
+<li>Analogy: volatile notice board means you see if the board is replaced. But if someone changes a sticky note on it, no guarantee you see the change.</li>
+</ul>
+<h3 id="atomic-compound-operations">Atomic Compound Operations</h3>
+<ul>
+<li>Individual <code>get()</code> and <code>put()</code> are atomic. But get-then-put is NOT atomic (check-then-act race).</li>
+<li>Fix: use <code>replace(key, oldVal, newVal)</code>, <code>compute()</code>, <code>merge()</code>, <code>putIfAbsent()</code> — these do check+update inside the bucket lock.</li>
+</ul>
+<hr>
+<h2 id="treemap">TreeMap</h2>
+<ul>
+<li>Red-black tree. O(log n) for get/put/remove.</li>
+<li>Keys must be Comparable or provide Comparator.</li>
+<li>NavigableMap methods: <code>floorKey()</code>, <code>ceilingKey()</code>, <code>subMap()</code>.</li>
+<li>Does NOT allow null keys (throws NPE). Allows null values.</li>
+<li>Use when you need sorted iteration or range queries. Otherwise prefer HashMap.</li>
+</ul>
+<h2 id="arraylist-vs-linkedlist">ArrayList vs LinkedList</h2>
+<ul>
+<li>ArrayList: dynamic array, O(1) random access, O(n) insert/delete in middle, amortized O(1) append.</li>
+<li>LinkedList: doubly-linked, O(1) insert/delete at known position, O(n) random access. Implements Deque.</li>
+<li><strong>ArrayList almost always wins</strong> due to CPU cache locality (contiguous memory).</li>
+<li>LinkedList only for queue/deque usage, and even then ArrayDeque is usually better.</li>
+</ul>
+<hr>
+<h2 id="common-interview-questions">Common Interview Questions</h2>
+<ol>
+<li>How does HashMap handle collisions? When does it treeify?</li>
+<li>What happens when you put a key with same hashCode but different equals?</li>
+<li>Why is ConcurrentHashMap&#39;s size() approximate?</li>
+<li>What&#39;s the time complexity of HashMap.get() in worst case? (O(log n) after treeification)</li>
+<li>Why doesn&#39;t ConcurrentHashMap allow null keys/values?</li>
+<li>How does HashMap resize? What&#39;s the performance implication?</li>
+<li>When would you choose TreeMap over HashMap?</li>
+<li>What happens if you modify a key object after putting it in a HashMap?</li>
+<li>What&#39;s the difference between <code>volatile Node[]</code> and <code>AtomicReferenceArray</code>?</li>
+<li>Why does ConcurrentHashMap use per-bucket locking instead of a global lock?</li>
+<li>Is <code>get()</code> followed by <code>put()</code> thread-safe on ConcurrentHashMap? How to fix it?</li>
+</ol>
+<h2 id="gotchas">Gotchas</h2>
+<ul>
+<li>Modifying a key&#39;s hashCode-relevant fields after insertion → entry unretrievable.</li>
+<li>HashMap iteration order is NOT guaranteed (use LinkedHashMap for insertion order).</li>
+<li><code>Collections.synchronizedMap()</code> ≠ ConcurrentHashMap — coarse-grained vs fine-grained locking.</li>
+<li><code>hashCode()</code> returning a constant → HashMap degrades to O(n).</li>
+<li><code>volatile</code> on array reference does NOT make elements volatile.</li>
+<li>ConcurrentHashMap&#39;s <code>get()</code> is lock-free but weakly consistent.</li>
+<li>check-then-act on ConcurrentHashMap is a race condition — use compound operations.</li>
+</ul>
+<h2 id="code-examples">Code Examples</h2>
+<ul>
+<li>the project source — HashMap implementation from scratch</li>
+<li>the project source — ConcurrentHashMap with per-bucket locking</li>
+</ul>
+<h2 id="references">References</h2>
+<ul>
+<li>OpenJDK HashMap source</li>
+<li>OpenJDK ConcurrentHashMap source (Doug Lea, ~6300 lines)</li>
+<li>Java Concurrency in Practice (Goetz) — Chapter 5</li>
+<li>Effective Java (Bloch) — Items 10, 11</li>
+</ul>
+
+  </div>
+  
+</article>
+
+</main>
+<footer class="foot">
+  <p>Kumar Saurav · 2026 · Generated from study notes. Diagrams render with Mermaid; code highlighting by highlight.js.</p>
+</footer>
+</body>
+</html>

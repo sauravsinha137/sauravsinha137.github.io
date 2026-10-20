@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Equals and HashCode Contract — Kumar Saurav — Interview Prep Notes</title>
+<meta name="description" content="Java: Equals and HashCode Contract">
+<link rel="canonical" href="https://sauravsinha137.github.io/equals-hashcode-contract/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script><script>hljs.highlightAll();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><a class="brand" href="/">Kumar Saurav — Interview Prep Notes</a></header>
+<main id="main">
+<article class="post">
+  <p class="kicker">Java · intermediate <span class="badge">Learning</span></p>
+  <h1>Equals and HashCode Contract</h1>
+  <p class="meta"><time datetime="2026-04-05">5 Apr 2026</time> · 6 min read</p>
+  
+  <div class="body">
+<p><strong>Status:</strong> Taught on 2026-04-05</p>
+<h2 id="concept-summary">Concept Summary</h2>
+<p>The equals/hashCode contract defines the rules these two methods must follow for hash-based collections (HashMap, HashSet) to work correctly. FAANG interviewers test whether you understand the rules, can implement both correctly, know what breaks when you get it wrong, and can spot bugs in existing implementations.</p>
+<h2 id="the-contract-three-rules">The Contract — Three Rules</h2>
+<h3 id="rule-1-equal-objects-must-have-the-same-hashcode">Rule 1: Equal objects MUST have the same hashCode</h3>
+<pre><code>If a.equals(b) is true → a.hashCode() MUST equal b.hashCode()</code></pre>
+<p>Why: HashMap uses hashCode to find the bucket, then equals to find the key. If equal objects have different hashCodes, they land in different buckets. get() looks in the wrong bucket and returns null — even though the key exists.</p>
+<h3 id="rule-2-same-hashcode-does-not-mean-equal">Rule 2: Same hashCode does NOT mean equal</h3>
+<pre><code>If a.hashCode() == b.hashCode() → a.equals(b) can be true OR false</code></pre>
+<p>This is just a hash collision. Two different keys in the same bucket. HashMap walks the chain and uses equals() to distinguish them. Normal and expected.</p>
+<h3 id="rule-3-unequal-objects-can-have-any-hashcode">Rule 3: Unequal objects CAN have any hashCode</h3>
+<p>Different hashCodes for different objects = ideal (fewer collisions). Same hashCode for all objects = legal but terrible performance (everything in one bucket → O(n)).</p>
+<hr>
+<h2 id="the-equals-five-properties">The equals() Five Properties</h2>
+<h3 id="1-reflexive-aequalsa-must-be-true">1. Reflexive: <code>a.equals(a)</code> must be <code>true</code></h3>
+<p>An object must equal itself.</p>
+<h3 id="2-symmetric-if-aequalsb-then-bequalsa">2. Symmetric: if <code>a.equals(b)</code> then <code>b.equals(a)</code></h3>
+<p>Classic violation: Employee.equals(String) returns true, but String.equals(Employee) returns false. Rule: only compare with your own type. Don&#39;t cross-type compare.</p>
+<h3 id="3-transitive-if-aequalsb-and-bequalsc-then-aequalsc">3. Transitive: if <code>a.equals(b)</code> and <code>b.equals(c)</code> then <code>a.equals(c)</code></h3>
+<p>Violated when subclass adds a field. ColorPoint(1,2,&quot;red&quot;).equals(Point(1,2)) = true, Point(1,2).equals(ColorPoint(1,2,&quot;blue&quot;)) = true, but ColorPoint(red).equals(ColorPoint(blue)) = false. No good solution with inheritance — favor composition when adding value fields to a subclass.</p>
+<h3 id="4-consistent-multiple-calls-return-same-result">4. Consistent: multiple calls return same result</h3>
+<p>As long as objects aren&#39;t modified. No randomness or time-dependence in equals.</p>
+<h3 id="5-xequalsnull-must-return-false">5. <code>x.equals(null)</code> must return <code>false</code></h3>
+<p>Never throw NPE, just return false. <code>instanceof</code> handles this automatically (null instanceof X = false).</p>
+<hr>
+<h2 id="correct-equals-pattern">Correct equals() Pattern</h2>
+<pre><code class="language-java">@Override
+public boolean equals(Object o) {
+    if (this == o) return true;                         // same reference, quick return
+    if (!(o instanceof Employee other)) return false;   // null-safe + type check + cast
+    return id == other.id &amp;&amp; Objects.equals(name, other.name);  // compare fields
+}</code></pre>
+<p>Key details:</p>
+<ul>
+<li><code>Objects.equals(a, b)</code> instead of <code>a.equals(b)</code> — handles null safely</li>
+<li><code>instanceof</code> not <code>getClass()</code> — allows subclass comparison (Liskov friendly)</li>
+<li>Primitives (<code>int</code>, <code>long</code>) compared with <code>==</code></li>
+<li><code>double</code>/<code>float</code> compared with <code>Double.compare()</code>/<code>Float.compare()</code> — NOT <code>==</code><ul>
+<li><code>0.1 + 0.2 == 0.3</code> is false (floating point imprecision)</li>
+<li><code>NaN == NaN</code> is false but <code>Double.compare(NaN, NaN) == 0</code> is true</li>
+<li><code>-0.0 == 0.0</code> is true but <code>Double.compare(-0.0, 0.0) != 0</code></li>
+</ul>
+</li>
+</ul>
+<h3 id="instanceof-vs-getclass">instanceof vs getClass()</h3>
+<ul>
+<li><code>instanceof</code>: Manager IS an Employee → comparison works across hierarchy</li>
+<li><code>getClass()</code>: Manager is NOT the same class as Employee → strict match only</li>
+<li>Effective Java: use instanceof for non-extendable classes. If subclasses add fields, consider composition.</li>
+</ul>
+<hr>
+<h2 id="correct-hashcode-pattern">Correct hashCode() Pattern</h2>
+<pre><code class="language-java">@Override
+public int hashCode() {
+    return Objects.hash(name, id);   // same fields as equals()
+}</code></pre>
+<p><strong>Golden rule: same fields in both methods.</strong></p>
+<ul>
+<li>Field in equals but not hashCode → equal objects might hash differently → BREAKS Rule 1</li>
+<li>Field in hashCode but not equals → legal but more collisions than necessary</li>
+<li>Same fields → correct AND optimal</li>
+</ul>
+<p>Why 31 in hash computation: Objects.hash internally uses <code>31 * result + element.hashCode()</code>. 31 is an odd prime, and <code>31 * x</code> is optimized by JVM to <code>(x &lt;&lt; 5) - x</code>.</p>
+<hr>
+<h2 id="java-records-free-implementation">Java Records — Free Implementation</h2>
+<pre><code class="language-java">public record Employee(String name, int id) {}</code></pre>
+<p>Automatically generates correct equals() (all fields), hashCode() (all fields), and toString(). Immutable by default — safe as HashMap keys. Mention this in interviews to show modern Java knowledge.</p>
+<hr>
+<h2 id="the-mutable-key-trap">The Mutable Key Trap</h2>
+<pre><code class="language-java">Employee emp = new Employee(&quot;alice&quot;, 1);
+Set&lt;Employee&gt; set = new HashSet&lt;&gt;();
+set.add(emp);           // hashCode based on &quot;alice&quot; → bucket 7
+emp.setName(&quot;bob&quot;);     // hashCode now based on &quot;bob&quot; → bucket 3
+set.contains(emp);      // looks in bucket 3 → not found! But emp IS in the set (bucket 7)</code></pre>
+<p>Object is in the set but unreachable. Can&#39;t find it, can&#39;t remove it, can&#39;t garbage collect it (set holds reference). Memory leak.</p>
+<p><strong>Rule:</strong> Never mutate fields used in hashCode after inserting into a hash collection. Use immutable fields or records.</p>
+<hr>
+<h2 id="string-vs-stringbuilder-behavior">String vs StringBuilder Behavior</h2>
+<p><strong>String</strong> — overrides equals() and hashCode(). Two String objects with same characters are equal.</p>
+<pre><code class="language-java">Set&lt;String&gt; set = new HashSet&lt;&gt;();
+set.add(new String(&quot;hello&quot;));
+set.contains(new String(&quot;hello&quot;));  // → true</code></pre>
+<p><strong>StringBuilder</strong> — does NOT override equals()/hashCode(). Uses Object defaults (memory address).</p>
+<pre><code class="language-java">Set&lt;StringBuilder&gt; set = new HashSet&lt;&gt;();
+set.add(new StringBuilder(&quot;hello&quot;));
+set.contains(new StringBuilder(&quot;hello&quot;));  // → false (different objects)</code></pre>
+<p>Why: StringBuilder is mutable. If hashCode was content-based, it would change on every append() → objects get lost in hash collections. JDK intentionally uses default identity-based equals/hashCode.</p>
+<p><strong>Safe as HashMap keys:</strong> String, Integer, Long, Double (all wrappers) — override both methods, immutable.
+<strong>Dangerous as keys:</strong> StringBuilder, ArrayList, arrays — don&#39;t override or are mutable.</p>
+<hr>
+<h2 id="equality-fields-don39t-have-to-be-all-fields">Equality Fields Don&#39;t Have to Be All Fields</h2>
+<p>Example: Two books are equal if they have the same ISBN + edition. Title is not part of equality.</p>
+<pre><code class="language-java">public class Book {
+    private String isbn;
+    private String title;
+    private int edition;
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Book b)) return false;
+        return edition == b.edition &amp;&amp; Objects.equals(isbn, b.isbn);
+        // title deliberately excluded
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(isbn, edition);
+        // title deliberately excluded — matches equals
+    }
+}</code></pre>
+<hr>
+<h2 id="common-interview-questions">Common Interview Questions</h2>
+<ol>
+<li>What happens if you override equals() but not hashCode()? (Different hashCodes for equal objects → wrong bucket → get() returns null)</li>
+<li>Write correct equals() and hashCode() for a given class.</li>
+<li>Can two unequal objects have the same hashCode? (Yes — collision, legal and expected)</li>
+<li>Why use the same fields in both methods?</li>
+<li>instanceof vs getClass() in equals — trade-offs?</li>
+<li>How do Java records handle equals/hashCode?</li>
+<li>What are the five properties of equals()?</li>
+<li>Why is StringBuilder unsafe as a HashMap key?</li>
+<li>What&#39;s wrong with comparing doubles using == in equals()?</li>
+<li>What is the mutable key trap?</li>
+</ol>
+<h2 id="gotchas">Gotchas</h2>
+<ul>
+<li>Overriding equals() without hashCode() is the #1 collections bug in Java.</li>
+<li><code>name.equals(other.name)</code> throws NPE if name is null. Use <code>Objects.equals()</code>.</li>
+<li><code>price == other.price</code> for doubles is wrong. Use <code>Double.compare()</code>.</li>
+<li>Mutable fields in hashCode → object gets &quot;lost&quot; in HashMap after mutation.</li>
+<li>Symmetric violation with cross-type equals (Employee.equals(String)).</li>
+<li>Transitivity violation when subclass adds fields to equals — no clean solution with inheritance.</li>
+<li>StringBuilder, ArrayList, arrays don&#39;t override equals/hashCode — unsafe as hash keys.</li>
+</ul>
+<h2 id="references">References</h2>
+<ul>
+<li>Effective Java (Bloch) — Items 10, 11</li>
+<li>OpenJDK Objects.hash source</li>
+</ul>
+
+  </div>
+  
+</article>
+
+</main>
+<footer class="foot">
+  <p>Kumar Saurav · 2026 · Generated from study notes. Diagrams render with Mermaid; code highlighting by highlight.js.</p>
+</footer>
+</body>
+</html>

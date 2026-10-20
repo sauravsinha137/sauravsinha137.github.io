@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Load Balancing &amp; Reverse Proxies — Kumar Saurav — Interview Prep Notes</title>
+<meta name="description" content="HLD: Load Balancing &amp; Reverse Proxies">
+<link rel="canonical" href="https://sauravsinha137.github.io/load-balancing-reverse-proxies/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/site.css">
+
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><a class="brand" href="/">Kumar Saurav — Interview Prep Notes</a></header>
+<main id="main">
+<article class="post">
+  <p class="kicker">HLD · intermediate <span class="badge">Practicing</span></p>
+  <h1>Load Balancing &amp; Reverse Proxies</h1>
+  <p class="meta"><time datetime="2026-04-19">19 Apr 2026</time> · 7 min read</p>
+  
+  <div class="body">
+<h2 id="1-what-problem-are-we-solving">1. What problem are we solving?</h2>
+<p>Four drivers, in order of importance at FAANG scale:</p>
+<ol>
+<li><strong>Horizontal scaling</strong> — fan traffic across many servers.</li>
+<li><strong>High availability</strong> — one server dies, reroute.</li>
+<li><strong>Geographic distribution</strong> — serve from closest POP.</li>
+<li><strong>Offload</strong> — TLS, compression, auth, rate limiting at edge.</li>
+</ol>
+<p>Interviewer test: articulate <em>which</em> driver applies before invoking an LB.</p>
+<hr>
+<h2 id="2-reverse-proxy-vs-load-balancer">2. Reverse Proxy vs Load Balancer</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Forward proxy</td>
+<td>Sits in front of <strong>clients</strong> (corporate egress). Wrong direction here.</td>
+</tr>
+<tr>
+<td>Reverse proxy</td>
+<td>Sits in front of <strong>servers</strong>. Does LB + caching + SSL + auth + compression + WAF.</td>
+</tr>
+<tr>
+<td>Load balancer</td>
+<td>Specifically distributes traffic. Subset of reverse-proxy capabilities.</td>
+</tr>
+</tbody></table>
+<p>Classic trap: <em>&quot;Is NGINX a LB or reverse proxy?&quot;</em> → Reverse proxy that can load balance.</p>
+<hr>
+<h2 id="3-layer-4-vs-layer-7-most-asked-question">3. Layer 4 vs Layer 7 — most-asked question</h2>
+<p><strong>L4 (TCP/UDP):</strong></p>
+<ul>
+<li>Routes on <code>(src IP, src port, dst IP, dst port)</code>. No payload parsing.</li>
+<li>Pros: fast, protocol-agnostic, supports TLS passthrough.</li>
+<li>Cons: no URL/header/cookie routing.</li>
+<li>Examples: AWS NLB, HAProxy <code>mode tcp</code>.</li>
+</ul>
+<p><strong>L7 (HTTP/gRPC):</strong></p>
+<ul>
+<li>Parses HTTP. Routes on path, host, header, cookie, method.</li>
+<li>Pros: smart routing, host-based routing, request inspection/modification, HTTP/2 multiplexing.</li>
+<li>Cons: slower (parsing), must decrypt TLS to inspect.</li>
+<li>Examples: AWS ALB, NGINX (HTTP), Envoy, HAProxy <code>mode http</code>.</li>
+</ul>
+<p><strong>Rule:</strong> L7 for HTTP apps. L4 for TLS passthrough, non-HTTP protocols, raw throughput.</p>
+<hr>
+<h2 id="4-algorithms">4. Algorithms</h2>
+<table>
+<thead>
+<tr>
+<th>Algorithm</th>
+<th>When</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Round robin</td>
+<td>Stateless, homogeneous servers, uniform request cost</td>
+</tr>
+<tr>
+<td>Weighted RR</td>
+<td>Heterogeneous hardware</td>
+</tr>
+<tr>
+<td>Least connections</td>
+<td>Long-lived connections or heterogeneous request duration</td>
+</tr>
+<tr>
+<td>Least response time</td>
+<td>Mixed backend performance</td>
+</tr>
+<tr>
+<td>IP hash</td>
+<td>Poor-man&#39;s sticky</td>
+</tr>
+<tr>
+<td>Consistent hashing</td>
+<td><strong>Sharded state</strong> (caches, stateful partitions) — NOT stateless tiers</td>
+</tr>
+<tr>
+<td>Power of two choices</td>
+<td>Modern LBs (Envoy, HAProxy) — near-optimal with low overhead</td>
+</tr>
+</tbody></table>
+<p><strong>Key trap: consistent hashing for stateless app servers is wrong.</strong></p>
+<ul>
+<li>Its only benefit is minimal remapping on topology change — only matters when a key has an <em>owning</em> node.</li>
+<li>Stateless servers have no owners. Any server works.</li>
+<li>Consistent hashing distributes load <em>worse</em> than RR (statistical hotspots), is blind to actual load, and adds complexity for zero benefit.</li>
+<li>&quot;Local cache locality&quot; = not stateless. Fix: externalize cache (Redis/Memcached, which uses consistent hashing <em>internally</em>), app tier becomes truly stateless, use RR/least-conn.</li>
+</ul>
+<hr>
+<h2 id="5-health-checks">5. Health checks</h2>
+<ul>
+<li><strong>Active:</strong> LB polls <code>/health</code>. <code>M</code> consecutive failures → unhealthy.</li>
+<li><strong>Passive:</strong> observe real traffic; 5xx/timeout → unhealthy.</li>
+<li>Use both.</li>
+</ul>
+<p><strong>Deep-healthcheck trap:</strong> checking every dependency cascades failures. FAANG pattern: separate <code>/live</code> (process alive) and <code>/ready</code> (deps OK). Kubernetes formalized this.</p>
+<p><strong>Connection draining / graceful shutdown:</strong> on scale-down or deploy, stop new requests to node, let existing finish until grace timeout (30–60s). Essential for long-lived connections (WebSocket, gRPC streams, file uploads).</p>
+<hr>
+<h2 id="6-sticky-sessions">6. Sticky sessions</h2>
+<p>Needed when server stores session state in memory. Methods: cookie-based, IP hash.</p>
+<p>Problems: uneven load, server death loses session, breaks elasticity.</p>
+<p><strong>FAANG-preferred:</strong> externalize session state to Redis; app tier stateless. Sticky only when truly unavoidable (WebSocket pin, legacy).</p>
+<hr>
+<h2 id="7-ssltls-termination">7. SSL/TLS termination</h2>
+<ol>
+<li><strong>At LB (most common):</strong> LB decrypts, sees plaintext, L7 routing. Backend gets plain HTTP (internal) or re-encrypted.</li>
+<li><strong>Passthrough (TLS bridging):</strong> LB forwards ciphertext (L4 only). Needed for end-to-end encryption, client cert auth, strict compliance.</li>
+<li><strong>Re-encrypt:</strong> terminate at LB → new TLS to backend. More CPU, better security posture.</li>
+</ol>
+<p>Why terminate at LB: central cert mgmt, offload crypto CPU, enables L7.</p>
+<hr>
+<h2 id="8-global-load-balancing">8. Global load balancing</h2>
+<ul>
+<li><strong>GeoDNS:</strong> authoritative DNS returns different IP per resolver location. Coarse (resolver ≠ client), slow failover (DNS TTL). Tools: Route 53, Cloudflare DNS.</li>
+<li><strong>Anycast:</strong> same IP announced from multiple PoPs via BGP; internet routes packets to topologically nearest. Sub-second failover, DDoS-resistant. Examples: 8.8.8.8, 1.1.1.1, CDN edge IPs.</li>
+<li><strong>Client-side LB:</strong> client picks endpoint from a list (gRPC default, service mesh).</li>
+</ul>
+<p>Big players combine: GeoDNS picks region → anycast within region handles PoP selection and failover.</p>
+<hr>
+<h2 id="9-ha-of-the-lb-itself">9. HA of the LB itself</h2>
+<ul>
+<li>Active-passive: VRRP + floating IP (keepalived).</li>
+<li>Active-active: DNS RR or ECMP.</li>
+<li>Cloud-managed: ALB/NLB multi-AZ by default.</li>
+</ul>
+<hr>
+<h2 id="10-real-world-tools">10. Real-world tools</h2>
+<ul>
+<li><strong>NGINX</strong> — reverse proxy/L7 standard.</li>
+<li><strong>HAProxy</strong> — best L4 + solid L7, battle-tested.</li>
+<li><strong>Envoy</strong> — modern, xDS dynamic config, service mesh native (Istio), <strong>gRPC-native</strong>.</li>
+<li><strong>AWS:</strong> NLB (L4), ALB (L7 HTTP/gRPC), CloudFront (global CDN).</li>
+</ul>
+<hr>
+<h2 id="11-grpc-l7-critical-for-microservices-interviews">11. gRPC + L7 — critical for microservices interviews</h2>
+<p>gRPC uses <strong>one long-lived HTTP/2 connection</strong> per client, multiplexing many RPCs as streams.</p>
+<p><strong>Why L4 fails:</strong> L4 balances per-connection. All RPCs from one client pin to one backend → hotspots. 3 clients + 10 backends = 3 backends used.</p>
+<p><strong>Why L7 works:</strong> HTTP/2-aware L7 routes per-stream across backends.</p>
+<p><strong>&quot;HTTP/2-aware&quot; vs &quot;gRPC-native&quot;:</strong></p>
+<ul>
+<li>HTTP/2-aware: ALB, NGINX. Routes streams, understands HTTP semantics.</li>
+<li>gRPC-native: Envoy, Linkerd. Understands gRPC status codes (separate from HTTP status), deadlines, streaming RPCs, per-method routing/retry.</li>
+</ul>
+<p><strong>Picks:</strong></p>
+<ul>
+<li>K8s → Envoy (Istio/Linkerd)</li>
+<li>AWS → ALB (not NLB)</li>
+<li>On-prem → Envoy or NGINX w/ gRPC module</li>
+</ul>
+<p><strong>K8s gotcha:</strong> vanilla <code>ClusterIP</code> Service = L4 (iptables/IPVS) → gRPC hotspots. Fix: service mesh (Envoy sidecar) or headless Service + client-side LB (<code>round_robin</code> policy in channel).</p>
+<hr>
+<h2 id="12-interview-gotchas">12. Interview gotchas</h2>
+<ol>
+<li>Consistent hashing for stateless tier — wrong.</li>
+<li>Sticky sessions as primary solution — bar raiser pushes back; externalize state.</li>
+<li>RR with heterogeneous request cost — least-connections instead.</li>
+<li>&quot;L7 is always better&quot; — wrong; L4 wins for TLS passthrough, non-HTTP, raw throughput.</li>
+<li>Forgetting connection draining during scale-down/deploy.</li>
+<li>Forgetting the LB needs its own HA.</li>
+<li>Not separating <code>/live</code> and <code>/ready</code>.</li>
+<li>L4 LB for gRPC — creates connection-pinning hotspots.</li>
+</ol>
+<hr>
+<h2 id="networking-primer-tier-1-only">Networking primer (Tier 1 only)</h2>
+<p><strong>PoP (Point of Presence):</strong> a small edge datacenter near users (Cloudflare ~300, Google ~200). Hosts caches, LBs, TLS terminators. Backs to origin (core DC) for cache misses.</p>
+<p><strong>BGP (Border Gateway Protocol):</strong> how ASes (Autonomous Systems) tell each other which IPs they can reach. Enables anycast: announce same IP from many locations, each external router picks nearest.</p>
+<p><strong>DNS:</strong></p>
+<ul>
+<li>Authoritative DNS = owner of domain&#39;s records.</li>
+<li>Recursive resolver = client&#39;s helper that walks hierarchy and caches answers.</li>
+<li>GeoDNS uses resolver IP (or client subnet via ECS) to return location-appropriate IP.</li>
+</ul>
+<p>Deeper networking (AS-path selection, peering vs transit, ECMP, VRRP) = overkill for generalist FAANG HLD. Skip.</p>
+<hr>
+<h2 id="interview-grade-one-liner-arsenal">Interview-grade one-liner arsenal</h2>
+<blockquote>
+<p><em>&quot;For a global user base, I&#39;d put a CDN in front. GeoDNS points each user to their nearest edge PoP, which serves cached content. Cache miss → edge fetches from origin over backbone. Anycast handles sub-second PoP failover.&quot;</em></p>
+</blockquote>
+<blockquote>
+<p><em>&quot;Sticky sessions are a smell; I&#39;d externalize session state to Redis so any server can serve any user. Keep app tier stateless → free horizontal scale.&quot;</em></p>
+</blockquote>
+<blockquote>
+<p><em>&quot;For gRPC I need an L7 HTTP/2-aware LB like Envoy or ALB, not L4 — otherwise all RPCs from one client pin to one backend.&quot;</em></p>
+</blockquote>
+<blockquote>
+<p><em>&quot;Consistent hashing belongs on the cache tier where keys have owners. On a stateless tier it hurts more than it helps — I&#39;d use least-connections.&quot;</em></p>
+</blockquote>
+<hr>
+
+  </div>
+  
+</article>
+
+</main>
+<footer class="foot">
+  <p>Kumar Saurav · 2026 · Generated from study notes. Diagrams render with Mermaid; code highlighting by highlight.js.</p>
+</footer>
+</body>
+</html>

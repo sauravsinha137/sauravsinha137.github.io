@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLD Problem: Rate Limiter — Kumar Saurav — Interview Prep Notes</title>
+<meta name="description" content="LLD: LLD Problem: Rate Limiter">
+<link rel="canonical" href="https://sauravsinha137.github.io/rate-limiter/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script><script>hljs.highlightAll();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><a class="brand" href="/">Kumar Saurav — Interview Prep Notes</a></header>
+<main id="main">
+<article class="post">
+  <p class="kicker">LLD · Design problem · intermediate <span class="badge">Learning</span></p>
+  <h1>LLD Problem: Rate Limiter</h1>
+  <p class="meta"><time datetime="2026-06-20">20 Jun 2026</time> · 3 min read</p>
+  
+  <div class="body">
+<h2 id="baseline-architecture-locked-2026-06-20">Baseline architecture (locked 2026-06-20)</h2>
+<ul>
+<li><strong>Single axis of variation = the algorithm.</strong> Unify it behind one interface:<pre><code class="language-java">interface RateLimitAlgorithm { boolean allow(String key); }</code></pre>
+Caller never knows which concrete algorithm is active → runtime-swappable (Strategy).</li>
+<li><strong><code>key</code> = WHO is limited</strong> (userId / ip / apiKey). The algorithm holds per-key state; it does not know what the key means.</li>
+<li><strong>Config is injected at construction, NOT passed per call.</strong> <code>allow(key)</code> stays clean.</li>
+<li><strong><code>TimeSource</code> abstraction injected</strong> so refill/window logic is testable by fast-forwarding a fake clock instead of <code>Thread.sleep</code>. Production wires <code>System::currentTimeMillis</code>.</li>
+<li><strong>Scope:</strong> single-machine / in-memory for LLD. Hide state behind a <code>Store</code> seam so Redis is a localized swap later — say this out loud, then park distributed (that&#39;s HLD).</li>
+</ul>
+<h3 id="key-misconception-corrected">Key misconception corrected</h3>
+<p>NOT all algorithms share <code>(limit, window)</code> config. Each algorithm owns its own config shape:</p>
+<table>
+<thead>
+<tr>
+<th>Algorithm</th>
+<th>What it does</th>
+<th>Config</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Fixed window</td>
+<td>x requests per fixed window (resets on boundary)</td>
+<td>limit, windowSec</td>
+</tr>
+<tr>
+<td>Sliding window log</td>
+<td>store each request timestamp, count last window</td>
+<td>limit, windowSec</td>
+</tr>
+<tr>
+<td>Sliding window counter</td>
+<td>weighted blend of current + previous window</td>
+<td>limit, windowSec</td>
+</tr>
+<tr>
+<td><strong>Token bucket</strong></td>
+<td>bucket of tokens, refills at rate; allows <strong>bursts</strong></td>
+<td>capacity (burst), refillRate</td>
+</tr>
+<tr>
+<td>Leaky bucket</td>
+<td>queue drained at constant rate; <strong>smooths</strong> output</td>
+<td>queueCapacity, leakRate</td>
+</tr>
+</tbody></table>
+<h3 id="construction-seam-build-when-algorithm-2-arrives-not-on-n1">Construction seam (build when algorithm #2 arrives, not on n=1)</h3>
+<p>Different constructors per algorithm is CORRECT, not a smell. Absorb the difference in two places:</p>
+<ul>
+<li>Per-algorithm config as <code>record</code>s under a <code>sealed interface AlgorithmConfig</code>.</li>
+<li>An <code>AlgorithmFactory</code> with an <strong>exhaustive switch</strong> over the sealed configs (compile-time safety in Java 21).
+The caller/<code>RateLimiter</code> only ever see <code>RateLimitAlgorithm</code>. Construction differences are quarantined in the factory.</li>
+</ul>
+<h3 id="two-axes-not-to-conflate">Two axes not to conflate</h3>
+<ul>
+<li><strong>Rule selection:</strong> <code>path / route → Rule{ algorithm, config }</code> (e.g. <code>/login</code> 5/min, <code>/search</code> 100/min).</li>
+<li><strong>Key:</strong> the identity counted within that rule.</li>
+</ul>
+<h3 id="allow-vs-throttle">allow vs throttle</h3>
+<p>A rate limiter&#39;s job is <strong>allow or reject</strong>. &quot;Throttle&quot; (delay/queue a request) is a <em>separate</em> component, not smuggled into <code>allow()</code>.</p>
+<hr>
+<h2 id="token-bucket-implemented-tdd-all-green">Token Bucket — implemented (TDD, all green)</h2>
+<p>Files: the project source TimeSource, TokenBucket, TokenBucketTest}.java<code>(No JUnit in project → ran with plain</code>javac<code>/</code>java` 21 via a tiny assert harness.)</p>
+<p>Design decisions worth defending in the room:</p>
+<ul>
+<li><strong>Per-key state:</strong> <code>ConcurrentHashMap&lt;String, Bucket&gt;</code>, bucket created lazily via <code>computeIfAbsent</code> (atomic creation).</li>
+<li><strong>Fractional tokens (<code>double</code>):</strong> so sub-second refill accrues (rate 2/s, 500ms elapsed → 1 token). Integer tokens would lose this.</li>
+<li><strong>Lazy refill:</strong> no background thread. On each call compute <code>tokens = min(capacity, tokens + elapsed * refillPerMilli)</code>. O(1), no scheduler.</li>
+<li><strong>Start full:</strong> a fresh client gets its full burst immediately.</li>
+<li><strong>Thread-safety:</strong> <code>synchronized</code> on the per-<code>Bucket</code> <code>tryConsume()</code> (refill + consume is a read-modify-write). Lock granularity is <strong>per key</strong>, so no global contention. A <code>volatile</code>/plain field would lose updates under races → over-admission.</li>
+<li><strong>Concurrency proven:</strong> 200 racing threads on one key, capacity 100 → exactly 100 admitted.</li>
+</ul>
+<h3 id="open-items-next">Open items / next</h3>
+<ul>
+<li><strong>Bucket eviction</strong> — unbounded keys = memory leak. Need idle TTL / LRU / size cap. (Interviewers WILL ask.)</li>
+<li><strong>Return type</strong> — <code>boolean</code> now; production wants <code>Decision{ allowed, retryAfterMs, remaining }</code> for <code>429 Retry-After</code>.</li>
+<li><strong>Algorithm #2 = FixedWindow</strong> → forces the <code>sealed AlgorithmConfig</code> + <code>AlgorithmFactory</code> seam.</li>
+<li>Then <strong>sliding-window-counter</strong> (the &quot;fix fixed-window&#39;s boundary burst&quot; story).</li>
+</ul>
+<hr>
+
+  </div>
+  
+</article>
+
+</main>
+<footer class="foot">
+  <p>Kumar Saurav · 2026 · Generated from study notes. Diagrams render with Mermaid; code highlighting by highlight.js.</p>
+</footer>
+</body>
+</html>

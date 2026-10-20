@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Real-time Updates — Kumar Saurav — Interview Prep Notes</title>
+<meta name="description" content="HLD: Real-time Updates">
+<link rel="canonical" href="https://sauravsinha137.github.io/realtime-updates/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/site.css">
+
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><a class="brand" href="/">Kumar Saurav — Interview Prep Notes</a></header>
+<main id="main">
+<article class="post">
+  <p class="kicker">HLD · intermediate-advanced</p>
+  <h1>Real-time Updates</h1>
+  <p class="meta"><time datetime="2026-07-29">29 Jul 2026</time> · 8 min read</p>
+  
+  <div class="body">
+<h2 id="1-what-problem-are-we-solving">1. What problem are we solving?</h2>
+<p>Delivering updates from server to client <strong>the moment they happen</strong> — chat messages, live locations, doc edits. Standard HTTP is request-response: client asks, server answers, connection closes. Real-time needs the <em>server</em> to push proactively.</p>
+<p><strong>The two-hop framing (use this structure in interviews):</strong></p>
+<ol>
+<li><strong>Hop 1 (client ↔ server):</strong> how does the update reach the client? → protocol choice (polling / long-polling / SSE / WebSocket / WebRTC)</li>
+<li><strong>Hop 2 (source → server):</strong> how does the update reach the <em>right</em> server holding the client&#39;s connection? → trigger choice (pull-polling / consistent hashing / pub-sub)</li>
+</ol>
+<p>Most candidates only talk about hop 1. Covering hop 2 is what separates senior answers.</p>
+<hr>
+<h2 id="2-networking-foundations-just-enough">2. Networking foundations (just enough)</h2>
+<ul>
+<li><strong>Layer 3 (IP):</strong> packet routing, best-effort — packets can be lost, duplicated, reordered.</li>
+<li><strong>Layer 4 (TCP/UDP):</strong> TCP = connection-oriented, ordered, reliable, costs setup (3-way handshake: SYN → SYN-ACK → ACK) and per-connection state. UDP = connectionless, spray and pray.</li>
+<li><strong>Layer 7 (HTTP, WebSocket, WebRTC):</strong> application protocols on top of TCP.</li>
+</ul>
+<p>Two interview-relevant consequences:</p>
+<ol>
+<li>Every round trip adds latency — connection setup happens <em>before</em> your data moves.</li>
+<li>A TCP connection is <strong>state</strong> on both ends. Without keep-alive, you pay setup/teardown per request.</li>
+</ol>
+<h3 id="l4-vs-l7-load-balancers-comes-up-constantly-with-websockets">L4 vs L7 load balancers (comes up constantly with WebSockets)</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>L4</th>
+<th>L7</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Operates on</td>
+<td>TCP/IP (IPs, ports)</td>
+<td>HTTP content (URL, headers, cookies)</td>
+</tr>
+<tr>
+<td>Connection</td>
+<td>Persistent client↔server TCP passthrough</td>
+<td>Terminates connection, opens new one to backend</td>
+</tr>
+<tr>
+<td>Speed</td>
+<td>Fast, minimal inspection</td>
+<td>More CPU (inspects packets)</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td><strong>WebSockets / persistent connections</strong></td>
+<td>HTTP traffic, long-polling, content-based routing</td>
+</tr>
+</tbody></table>
+<p>Rule of thumb: L4 for WebSockets (same TCP connection sticks to one server natively); L7 for HTTP-based approaches (more routing flexibility).</p>
+<hr>
+<h2 id="3-hop-1-client-server-protocols">3. Hop 1: Client-server protocols</h2>
+<h3 id="simple-polling-the-baseline">Simple polling — the baseline</h3>
+<p>Client hits <code>/api/updates</code> every N seconds.</p>
+<ul>
+<li>✅ Dead simple, stateless, no special infra, quick to explain in interview.</li>
+<li>❌ Latency up to poll interval; wasted requests; connection churn (mitigate with HTTP keep-alive longer than the poll interval).</li>
+<li><strong>Use when:</strong> latency of 2–5s is acceptable. Many &quot;real-time&quot; problems don&#39;t actually need real-time. Propose it explicitly: <em>&quot;I&#39;ll start with polling so I can focus on X; we can upgrade later.&quot;</em></li>
+</ul>
+<h3 id="long-polling-the-easy-upgrade">Long polling — the easy upgrade</h3>
+<p>Client makes request → server <strong>holds it open</strong> until data exists → responds → client immediately re-requests.</p>
+<ul>
+<li>✅ Near real-time, plain HTTP, stateless, works everywhere.</li>
+<li>❌ <strong>Latency for rapid-fire updates</strong>: after each response the client must make a new round trip. Two updates 10ms apart: first arrives in ~100ms, second up to ~290ms (finish first response + new request + response). Also: HTTP overhead per message, hanging requests complicate monitoring, browser per-domain connection limits.</li>
+<li>Infra note: every hop (load balancer, proxy) must tolerate long-lived requests — don&#39;t let the LB hang up at 30s when your server holds for 60s. Typical hold: 15–30s.</li>
+<li><strong>Use when:</strong> infrequent updates, e.g. waiting for a payment/async job to complete.</li>
+</ul>
+<h3 id="server-sent-events-sse-efficient-one-way-street">Server-Sent Events (SSE) — efficient one-way street</h3>
+<p>An HTTP response with <code>Transfer-Encoding: chunked</code> that never &quot;finishes&quot; — server streams chunks as events occur. Browser-native via <code>EventSource</code>.</p>
+<ul>
+<li>✅ One persistent connection, no per-message re-request (fixes long-polling&#39;s rapid-update latency), auto-reconnect built into browsers, still plain HTTP.</li>
+<li>✅ Reconnection gap-fill: SSE standard has <strong>Last-Event-ID</strong> — client reconnects with the last ID it saw, server replays what was missed.</li>
+<li>❌ <strong>One-way only</strong> (server → client). Some proxies/LBs buffer responses and silently break streaming — nasty to debug. Browser per-domain connection limits.</li>
+<li><strong>Use when:</strong> server-push-only. Live dashboards, notification feeds, <strong>AI token streaming (ChatGPT-style)</strong> — the canonical modern example.</li>
+</ul>
+<h3 id="websockets-full-duplex-champion">WebSockets — full-duplex champion</h3>
+<p>Starts as HTTP, then <strong>Upgrade</strong> handshake switches the TCP connection to the WebSocket protocol (cookies/auth headers from the HTTP phase carry over). Both sides then send opaque messages freely.</p>
+<ul>
+<li>✅ True bi-directional, lowest overhead per message (no headers), ideal for high-frequency read+write.</li>
+<li>❌ Stateful connections → hard parts:<ul>
+<li><strong>Load balancing:</strong> prefer L4; use &quot;least connections&quot; strategy; you&#39;re stuck with each allocation decision.</li>
+<li><strong>Deployments:</strong> restarting servers severs connections → need reconnect logic + catch-up on missed messages.</li>
+<li><strong>Every infra hop must support the upgrade.</strong></li>
+</ul>
+</li>
+<li><strong>Reference architecture:</strong> terminate WebSockets in a dedicated, rarely-redeployed <strong>WebSocket service</strong> at the edge; keep the rest of the system stateless and let it scale independently.</li>
+<li><strong>Use when:</strong> high-frequency AND bi-directional (chat, multiplayer games, collaborative editing).</li>
+<li>⚠️ Common candidate mistake: reaching for WebSockets too eagerly. Pattern that often wins: <strong>SSE for updates + plain HTTP POST for writes.</strong> Writes are usually infrequent enough.</li>
+</ul>
+<h3 id="webrtc-peer-to-peer">WebRTC — peer-to-peer</h3>
+<p>Browsers talk <strong>directly to each other</strong>; server is only a lightweight <strong>signaling server</strong> (peer discovery + connection info exchange — itself needs WebSocket/SSE!). NAT traversal via <strong>STUN</strong> (hole punching to get publicly routable address) and <strong>TURN</strong> (relay fallback when direct fails).</p>
+<ul>
+<li>✅ Lowest latency, offloads bandwidth from your servers, native audio/video.</li>
+<li>❌ Most complex; connection setup delay; NAT/firewall pain.</li>
+<li><strong>Use when:</strong> audio/video calls (only real choice), or offloading server load in collaborative apps (cursor/presence sharing — Canva; Google-Docs-style editing with CRDTs).</li>
+</ul>
+<h3 id="decision-flowchart-memorize">Decision flowchart (memorize)</h3>
+<ol>
+<li>Not latency-sensitive? → <strong>Simple polling</strong></li>
+<li>Server-push only, no frequent client writes? → <strong>SSE</strong></li>
+<li>High-frequency bi-directional? → <strong>WebSocket</strong></li>
+<li>Audio/video? → <strong>WebRTC</strong></li>
+</ol>
+<hr>
+<h2 id="4-hop-2-getting-updates-to-the-right-server">4. Hop 2: Getting updates to the right server</h2>
+<p>With persistent connections (long-poll/SSE/WS), <strong>one specific server</strong> holds User C&#39;s connection. When a message for User C arrives anywhere in the system, how does it find that server?</p>
+<h3 id="option-a-pull-via-polling">Option A: Pull via polling</h3>
+<p>No routing needed — updates land in a DB, clients poll it (<code>messages WHERE ts &gt; last_seen</code>). Source and consumer fully decoupled.</p>
+<ul>
+<li>❌ Latency; and watch the math: <strong>1M clients polling every 10s = 100k reads/sec.</strong></li>
+<li><strong>Use when:</strong> paired with simple polling, real-time not truly needed.</li>
+</ul>
+<h3 id="option-b-push-via-consistent-hashing">Option B: Push via consistent hashing</h3>
+<p>Each user is <em>owned</em> by one server, determined by hashing.</p>
+<ul>
+<li>Naive: <code>server = hash(userId) % N</code>, with N and server list managed in a coordination service (<strong>ZooKeeper/etcd</strong>). Client connects anywhere → gets redirected to its owner. Sender hashes recipient&#39;s ID → knows exactly which server to deliver to.</li>
+<li>Problem: changing N remaps almost everyone → <strong>consistent hashing</strong>: servers + users on a hash ring, user connects to next server clockwise. Scaling moves only the affected ring segment.</li>
+<li>✅ Predictable routing, minimal churn on scale events, keeps heavy per-connection state in exactly one place.</li>
+<li>❌ Complex; needs coordination service; server failure loses that connection state.</li>
+<li>Scaling event choreography (senior talking point): record old+new assignments → drain/reconnect clients gradually → dual-deliver to old+new server during transition → finalize.</li>
+<li><strong>Use when:</strong> connections carry <strong>expensive server-side state</strong> (e.g. Google Docs: loaded doc + pending ops + collaborator sync).</li>
+</ul>
+<h3 id="option-c-push-via-pubsub-default-choice">Option C: Push via Pub/Sub (default choice)</h3>
+<p>Central pub/sub layer (<strong>Redis pub/sub, Kafka</strong>) holds the routing state. Client connects to <em>any</em> lightweight <strong>endpoint server</strong>, which subscribes to that user&#39;s topic. Publishers push to the topic; pub/sub fans out to subscribed endpoint servers; they forward down the existing connections.</p>
+<ul>
+<li>✅ Endpoint servers stateless-ish and interchangeable → trivial LB (&quot;least connections&quot;); efficient broadcast to many clients; state confined to pub/sub layer. Latency cost minimal (&lt;10ms).</li>
+<li>❌ Pub/sub is a SPOF/bottleneck (scale with Redis Cluster — shard subscriptions by key); no visibility into subscriber connect/disconnect; many-to-many connections between pub/sub nodes and endpoint servers.</li>
+<li><strong>Use when:</strong> small messages, no heavy per-connection state, broadcast-heavy. <strong>The default for most interview problems.</strong></li>
+</ul>
+<p>Rule: heavy per-connection state → consistent hashing; lightweight message forwarding → pub/sub.</p>
+<hr>
+<h2 id="5-common-deep-dives-prepare-answers">5. Common deep dives (prepare answers)</h2>
+<p><strong>&quot;How do you handle connection failures / reconnection?&quot;</strong></p>
+<ul>
+<li>Heartbeats (ping/pong) to detect zombie connections — a broken WebSocket doesn&#39;t always signal.</li>
+<li>Track delivery: sequence numbers or per-user message queue; on reconnect, client sends last-seen ID and server replays the gap. <strong>Redis Streams</strong> is a popular implementation. (SSE gives you Last-Event-ID for free.)</li>
+</ul>
+<p><strong>&quot;Celebrity posts, millions of followers need the update?&quot;</strong></p>
+<ul>
+<li>Naive fan-out to millions of per-user feeds crushes the system. Cache the update once + <strong>hierarchical distribution</strong>: regional/intermediate servers pull once, push to their local clients. Batching + aggregation layers.</li>
+</ul>
+<p><strong>&quot;Message ordering across distributed servers?&quot;</strong></p>
+<ul>
+<li>Full generality: vector clocks / logical timestamps. But for product-style interviews the right answer is usually: <strong>funnel related messages through a single server/partition</strong> (e.g. one Kafka partition per chat room) → single point stamps a total order. Trades some scalability for simplicity — say that trade-off out loud.</li>
+</ul>
+<hr>
+<h2 id="6-interview-strategy">6. Interview strategy</h2>
+<ul>
+<li><strong>Name the requirement early:</strong> &quot;messages need instant delivery to all participants — WebSockets&quot; / &quot;character-level edits need sub-second propagation.&quot;</li>
+<li><strong>Don&#39;t over-engineer.</strong> If polling suffices, propose it with the upgrade path as a backdoor. Simplicity is valued at senior+.</li>
+<li><strong>Cover both hops.</strong> Protocol choice AND server-side propagation.</li>
+<li>Canonical mappings:<ul>
+<li>Chat/WhatsApp → WebSocket + pub/sub, ordering per room, presence/typing indicators</li>
+<li>Live comments (FB Live) → SSE/WS + hierarchical aggregation for extreme fan-out</li>
+<li>Google Docs → WebSocket + consistent hashing (doc state) + OT/CRDT for conflicts</li>
+<li>Live dashboards / Robinhood → SSE, discuss &quot;how real-time is real-time enough&quot;</li>
+<li>ChatGPT → SSE token streaming</li>
+<li>Games/calls → WebRTC (+ WS for server coordination)</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="7-quick-fire-gotchas">7. Quick-fire gotchas</h2>
+<ul>
+<li>Long polling ≠ low latency for <em>bursts</em> of updates (the re-request round trip).</li>
+<li>SSE breaks silently behind buffering proxies.</li>
+<li>WebSocket upgrade must be supported by <em>every</em> hop, not just your server.</li>
+<li>L7 LB terminates connections — doesn&#39;t guarantee same backend TCP connection; L4 does.</li>
+<li>Browser per-domain connection limits bite both long-polling and SSE.</li>
+<li>Deployments churn persistent connections — always have a reconnect + catch-up story.</li>
+<li>WebRTC still needs a server (signaling + STUN/TURN); &quot;peer-to-peer&quot; isn&#39;t serverless.</li>
+<li>1M pollers × 10s interval = 100k TPS — always do the polling math.</li>
+</ul>
+
+  </div>
+  
+</article>
+
+</main>
+<footer class="foot">
+  <p>Kumar Saurav · 2026 · Generated from study notes. Diagrams render with Mermaid; code highlighting by highlight.js.</p>
+</footer>
+</body>
+</html>

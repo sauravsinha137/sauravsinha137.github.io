@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HLD Problem: Design URL Shortener (Bit.ly) — Kumar Saurav — Interview Prep Notes</title>
+<meta name="description" content="HLD: HLD Problem: Design URL Shortener (Bit.ly)">
+<link rel="canonical" href="https://sauravsinha137.github.io/design-url-shortener/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/site.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.12.0/mermaid.min.js"></script><script>mermaid.initialize({startOnLoad:true,theme:"neutral"});</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script><script>hljs.highlightAll();</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><a class="brand" href="/">Kumar Saurav — Interview Prep Notes</a></header>
+<main id="main">
+<article class="post">
+  <p class="kicker">HLD · Design problem · intermediate</p>
+  <h1>HLD Problem: Design URL Shortener (Bit.ly)</h1>
+  <p class="meta"><time datetime="2026-10-20">20 Oct 2026</time> · 13 min read</p>
+  
+  <div class="body">
+<h2 id="designing-bitly-the-quoteasyquot-question-that-isn39t">Designing Bit.ly: The &quot;Easy&quot; Question That Isn&#39;t</h2>
+<blockquote>
+<p>A long-form writeup of the URL shortener problem, inspired by the <a href="https://www.hellointerview.com/learn/system-design/problem-breakdowns/bitly">Hello Interview breakdown</a>, with my own diagrams, numbers, Java notes, and commentary layered on top. Diagrams are in Mermaid.</p>
+</blockquote>
+<p>URL shortener is the problem interviewers reach for when they want to see <em>how you think</em>, not <em>what you know</em>. There are almost no hard components. What is hard is being disciplined: scoping fast, noticing the one number that shapes everything (reads outnumber writes ~1000:1), and then picking the simplest thing at every fork while still being able to say <em>why</em> the fancier option exists.</p>
+<p>Three tensions drive the whole design:</p>
+<ol>
+<li><strong>Uniqueness vs. shortness vs. speed</strong> of code generation. You can have any two cheaply; all three takes a decision.</li>
+<li><strong>Read-heavy to an absurd degree.</strong> 100M DAU clicking, ~1 write/sec creating. The write path can be boring; the read path has to be fast and always up.</li>
+<li><strong>Availability over consistency.</strong> A redirect that is 50ms stale is fine. A redirect that 500s is not.</li>
+</ol>
+<h2 id="1-scoping-the-problem">1. Scoping the Problem</h2>
+<h3 id="functional-requirements-the-top-3">Functional requirements (the top 3)</h3>
+<ol>
+<li>Submit a long URL, get a short one back<ul>
+<li>optional <strong>custom alias</strong> (<code>short.ly/my-launch</code>)</li>
+<li>optional <strong>expiration date</strong></li>
+</ul>
+</li>
+<li>Visit the short URL, get redirected to the original</li>
+</ol>
+<p>Deliberately below the line: auth/accounts, click analytics, spam &amp; malware filtering. Say so out loud. Analytics in particular is the trap: it is &quot;obviously&quot; part of Bit.ly, and it drags in an entire event pipeline. Park it and reclaim the time for the deep dives.</p>
+<h3 id="non-functional-requirements-where-the-design-is-decided">Non-functional requirements — where the design is decided</h3>
+<table>
+<thead>
+<tr>
+<th>NFR</th>
+<th>What it forces</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Uniqueness</strong>: one short code → exactly one long URL</td>
+<td>The code generation strategy is the first deep dive</td>
+</tr>
+<tr>
+<td><strong>Redirect latency &lt; 100ms</strong></td>
+<td>Cache in front of the DB; possibly CDN/edge</td>
+</tr>
+<tr>
+<td><strong>Availability ≫ consistency</strong>, 99.99%</td>
+<td>Replicas, cache as a shield, fail-open on the read path</td>
+</tr>
+<tr>
+<td><strong>1B URLs, 100M DAU</strong></td>
+<td>Sizing says a single Postgres fits; scale the <em>services</em>, not the data</td>
+</tr>
+</tbody></table>
+<p>The number to say early: <strong>read:write ≈ 1000:1</strong>. Every later decision (cache, service split, DB choice) is downstream of it. Interviewers listen for whether you <em>derive</em> the architecture from this ratio or just recite &quot;add a cache&quot;.</p>
+<hr>
+<h2 id="2-core-entities-and-data-model">2. Core Entities and Data Model</h2>
+<p>Keep it to a list at first; flesh out columns once the API is settled.</p>
+<pre class="mermaid">erDiagram
+    USER ||--o{ URL : creates
+    URL {
+        string short_code PK
+        string original_url
+        timestamp created_at
+        timestamp expires_at
+        uuid created_by FK
+    }
+    USER {
+        uuid user_id PK
+    }</pre>
+<p>One table does the job. <code>short_code</code> is the primary key (it <em>is</em> the lookup key, so it gets the index for free). Row size estimate: code ~8B, URL ~100B, two timestamps ~16B, alias ~100B, padding/metadata → call it <strong>500B</strong> to be safe.</p>
+<blockquote>
+<p><strong>Dedup or not?</strong> Hashing the URL would let the same long URL always map to the same code. Most real shorteners <em>don&#39;t</em> dedup: two users want separate expirations, separate analytics, separate aliases. Say the tradeoff, pick no-dedup, move on.</p>
+</blockquote>
+<hr>
+<h2 id="3-api-surface">3. API Surface</h2>
+<pre><code class="language-http">POST /urls
+{ &quot;long_url&quot;: &quot;https://example.com/a/very/long/path&quot;,
+  &quot;custom_alias&quot;: &quot;optional&quot;,
+  &quot;expiration_date&quot;: &quot;optional ISO-8601&quot; }
+→ 201 { &quot;short_url&quot;: &quot;https://short.ly/abc123&quot; }
+
+GET /{short_code}
+→ 302 Found
+   Location: https://example.com/a/very/long/path
+→ 404 if unknown · 410 Gone if expired</code></pre>
+<h3 id="301-vs-302-a-guaranteed-follow-up">301 vs 302 — a guaranteed follow-up</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>301 Moved Permanently</th>
+<th>302 Found</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Browser caches it</td>
+<td>Yes — later clicks skip your server entirely</td>
+<td>No — every click hits you</td>
+</tr>
+<tr>
+<td>Server load</td>
+<td>Lower</td>
+<td>Higher</td>
+</tr>
+<tr>
+<td>Can you expire / edit the link later?</td>
+<td>Not for users who already clicked</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Analytics possible?</td>
+<td>No (you never see repeat clicks)</td>
+<td>Yes</td>
+</tr>
+</tbody></table>
+<p>Pick <strong>302</strong>. The whole product value of a shortener (control, expiration, click counting) depends on owning every hop. If the interviewer pushes &quot;but 301 saves load&quot; the answer is: the cache makes the load trivial, and the control is the product.</p>
+<hr>
+<h2 id="4-high-level-architecture">4. High-Level Architecture</h2>
+<pre class="mermaid">flowchart LR
+    C[Client] --&gt;|POST /urls| S[Primary Server]
+    C --&gt;|GET /abc123| S
+    S --&gt; DB[(Postgres&lt;br/&gt;urls table)]
+    S -.-&gt;|302 Location| C</pre>
+<p><strong>Write path:</strong> validate URL format → canonicalize → generate a short code (magic box for now) → if a custom alias was supplied, use that instead after checking it is free → <code>INSERT</code> → return.</p>
+<p><strong>Read path:</strong> look up code → if missing, 404 → if <code>expires_at &lt; now()</code>, 410 → else 302 with <code>Location</code>.</p>
+<p>Expired rows: a nightly sweeper job deletes them, <em>or</em> just leave them and let the read path reject. What actually matters is that the <strong>cache TTL ≤ time-to-expiry</strong>, so a stale entry cannot outlive its row.</p>
+<p>That is a working system. Everything below is the interviewer asking &quot;and how do you make it good?&quot;</p>
+<hr>
+<h2 id="5-deep-dive-1-generating-unique-short-codes">5. Deep Dive 1 — Generating Unique Short Codes</h2>
+<p>Three constraints: unique, short, cheap to produce. Walk the ladder.</p>
+<h3 id="prefix-of-the-long-url">❌ Prefix of the long URL</h3>
+<p><code>www.linkedin.com/in/...</code> → <code>short.ly/www.link</code>. Every LinkedIn profile collides. Mentioned only to show the uniqueness constraint is real.</p>
+<h3 id="hash-and-truncate">🟡 Hash and truncate</h3>
+<pre><code>canonical = canonicalize(long_url)      # lowercase host, strip default port, trailing slash…
+digest    = sha256(canonical)
+code      = base62(digest)[:8]           # 62^8 ≈ 218 trillion codes</code></pre>
+<p><strong>Why base62?</strong> <code>a-z A-Z 0-9</code> — base64 minus <code>+</code> and <code>/</code>, because <code>/</code> is a path separator and <code>+</code> decodes as a space in query strings.</p>
+<p><strong>The collision math</strong> (say this unprompted): with <code>|S|</code> possible codes and <code>n</code> already used, the chance the next one collides is <code>n / |S|</code>. At 1B URLs and 8-char codes that is 1B / 218T ≈ 5×10⁻⁶ per insert — rare, not zero. So you <em>must</em> have a <code>UNIQUE</code> constraint on <code>short_code</code>, catch the violation, and retry with a salt, bounded to 3–5 attempts. Every retry is an extra DB round trip on the write path.</p>
+<p>Truncating a hash is also a choice between determinism (same URL → same code, which gives you dedup) and unpredictability (add an HMAC secret). Know which one you are picking.</p>
+<h3 id="global-counter-base62">✅ Global counter + base62</h3>
+<pre><code>id   = INCR counter           # Redis, atomic, single-threaded
+code = base62(id)</code></pre>
+<ul>
+<li><strong>Zero collisions by construction.</strong> No retry loop, no uniqueness check before insert.</li>
+<li><strong>Short:</strong> 1,000,000,000 in base62 is <code>15ftgG</code> — six characters at a billion URLs. 62⁶ ≈ 56B before you need a 7th character; 62⁷ ≈ 3.5T.</li>
+<li><strong>Reversible:</strong> <code>base62⁻¹(code)</code> gives you the row id if you ever shard by id.</li>
+</ul>
+<p>Two costs, both of which the interviewer will raise:</p>
+<ol>
+<li><strong>Predictability.</strong> <code>15ftgG</code> → <code>15ftgH</code> is the next link. Anyone can enumerate every URL you have ever shortened. Mitigation: a cheap reversible bijection before encoding (XOR with a secret, or a Feistel round / multiplicative inverse mod 62ⁿ). Or accept it: short links are public by design. State the choice.</li>
+<li><strong>Coordination.</strong> A counter is a single point of agreement. Fine with one server; a problem with many. That is Deep Dive 3.</li>
+</ol>
+<blockquote>
+<p><strong>Custom aliases vs. generated codes.</strong> They share one namespace, so a user could claim <code>15ftgH</code> today and break tomorrow&#39;s generated code. Fix: give generated codes a prefix character aliases are not allowed to use, or keep aliases in a separate column/namespace and check both on read.</p>
+</blockquote>
+<p><strong>Java note:</strong> the encode is a 10-line loop (<code>id % 62</code>, <code>id /= 62</code>, reverse). Writing <code>Base62.encode(long)</code> on the whiteboard, with the alphabet as a <code>static final char[]</code>, is a cheap credibility win.</p>
+<hr>
+<h2 id="6-deep-dive-2-making-redirects-fast">6. Deep Dive 2 — Making Redirects Fast</h2>
+<p>A DB lookup on an indexed primary key is already O(log n). The question is really about the <strong>100ms budget</strong> and <strong>100M DAU</strong> pounding one table.</p>
+<h3 id="in-memory-cache-in-front-of-the-db">✅ In-memory cache in front of the DB</h3>
+<pre class="mermaid">flowchart LR
+    C[Client] --&gt;|GET /abc123| S[Read Service]
+    S --&gt;|1. GET abc123| R[(Redis&lt;br/&gt;code → url)]
+    R -.-&gt;|hit| S
+    S --&gt;|2. miss: SELECT| DB[(Postgres)]
+    S -.-&gt;|SET abc123 url EX ttl| R
+    S -.-&gt;|302| C</pre>
+<p>Cache-aside, read-through on miss. Orders of magnitude to have ready:</p>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Access time</th>
+<th>Ops/sec</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Memory</td>
+<td>~100 ns</td>
+<td>millions</td>
+</tr>
+<tr>
+<td>SSD</td>
+<td>~0.1 ms</td>
+<td>~100k IOPS</td>
+</tr>
+<tr>
+<td>HDD</td>
+<td>~10 ms</td>
+<td>~100–200</td>
+</tr>
+</tbody></table>
+<p>What to say about it, beyond &quot;add Redis&quot;:</p>
+<ul>
+<li><strong>Eviction:</strong> LRU. Click traffic is Zipfian; a small hot set serves most reads.</li>
+<li><strong>TTL ≤ expiry</strong> so an expired link never redirects from cache.</li>
+<li><strong>Invalidation</strong> is nearly free here because mappings are immutable. The only writes that touch the cache are deletes/expirations: <code>DEL</code> the key.</li>
+<li><strong>Cold start / warm-up:</strong> after a cache restart the DB takes the full read load briefly. Replicas absorb it; so does a cache with persistence.</li>
+<li><strong>Negative caching:</strong> cache 404s for a short TTL, or an attacker enumerating random codes turns every miss into a DB hit.</li>
+</ul>
+<h3 id="cdn-edge-redirect-the-quotif-money-is-no-objectquot-tier">✅✅ CDN / edge redirect (the &quot;if money is no object&quot; tier)</h3>
+<p>Serve <code>short.ly</code> through a CDN and run the redirect in an edge function (Cloudflare Workers, Lambda@Edge). Popular codes resolve at the PoP nearest the user and never reach your origin. Trade: cross-PoP invalidation, edge runtime limits, cost, and harder debugging. Offer it, name the trade, don&#39;t build it unless the interviewer wants it.</p>
+<hr>
+<h2 id="7-deep-dive-3-scaling-to-1b-urls-and-100m-dau">7. Deep Dive 3 — Scaling to 1B URLs and 100M DAU</h2>
+<h3 id="storage-do-the-arithmetic-then-relax">Storage: do the arithmetic, then relax</h3>
+<p>500 B × 1B rows = <strong>500 GB</strong>. One modern SSD. Writes are ~100k/day ≈ <strong>1 row/sec</strong>. So: <strong>a single Postgres primary with read replicas is correct</strong>, and anyone proposing sharding at this point has not done the math. Say that explicitly; it is a senior signal.</p>
+<p>DB choice: anything (Postgres, MySQL, DynamoDB). The cache has already taken the read load off it and the write rate is trivial. Pick the one you can defend — Postgres.</p>
+<p><strong>If the primary dies:</strong> streaming replicas + automatic failover for availability; periodic snapshots for durability. Because reads come from the cache and replicas, a primary failover mostly degrades <em>writes</em>, which is the path nobody is waiting on.</p>
+<h3 id="compute-split-read-and-write-scale-them-separately">Compute: split read and write, scale them separately</h3>
+<pre class="mermaid">flowchart LR
+    C[Client] --&gt; GW[API Gateway / LB]
+    GW --&gt;|GET /code| RS[Read Service ×N]
+    GW --&gt;|POST /urls| WS[Write Service ×M]
+    RS --&gt; R[(Redis cache)]
+    RS --&gt; DB[(Postgres&lt;br/&gt;primary + replicas)]
+    WS --&gt;|INCR counter 1000| CTR[(Redis counter)]
+    WS --&gt; DB
+    WS -.-&gt;|DEL on delete/expire| R
+
+    style R fill:#1a4d2e,color:#fff
+    style CTR fill:#1a4d2e,color:#fff
+    style RS fill:#2d2d4d,color:#fff</pre>
+<p>Reads are stateless lookups; they scale horizontally for free. Writes are the only place with shared state, so they deserve the attention.</p>
+<h3 id="the-counter-under-horizontal-scale">The counter under horizontal scale</h3>
+<p>Many Write Service instances must agree on &quot;next id&quot;. Options:</p>
+<ul>
+<li><strong>Central Redis <code>INCR</code>.</strong> Single-threaded, atomic, 100k+ ops/sec, which is five orders of magnitude more than our write rate. One extra network hop per create; negligible.</li>
+<li><strong>Counter batching.</strong> Each instance does <code>INCRBY counter 1000</code> once and hands out ids from its local range. Redis traffic drops by 1000×. A crashed instance leaks the unused tail of its range; who cares, we need <em>unique</em>, not <em>contiguous</em>.</li>
+<li><strong>Redis failover.</strong> Sentinel/Cluster for HA. If a failover loses a few un-replicated increments you could, in theory, hand out an id twice. The <code>UNIQUE</code> constraint on <code>short_code</code> is the backstop: the second insert fails and you fetch a new batch. (Same conditional-write-at-the-datastore principle as the first rung in <a href="/dealing-with-contention/">14-dealing-with-contention</a>.)</li>
+<li><strong>Multi-region.</strong> Give each region a disjoint range (A: 0–1B, B: 1B–2B). Writes stay local; reads are served from regional caches. No cross-region coordination on the hot path.</li>
+</ul>
+<p>Alternative the interviewer may want you to name: <strong>Twitter Snowflake-style ids</strong> (timestamp + machine id + sequence) remove the central counter entirely, at the cost of 11-char codes. For a <em>shortener</em>, the shortness wins and the Redis counter stays.</p>
+<hr>
+<h2 id="8-the-assembled-system">8. The Assembled System</h2>
+<pre class="mermaid">flowchart TB
+    C[Client] --&gt; GW[API Gateway]
+    GW --&gt;|GET| RS[Read Service&lt;br/&gt;cache → DB → 302]
+    GW --&gt;|POST| WS[Write Service&lt;br/&gt;counter → base62 → INSERT]
+    WS --&gt; CTR[(Redis counter&lt;br/&gt;batched INCRBY)]
+    RS --&gt; CACHE[(Redis cache&lt;br/&gt;code → url, LRU, TTL ≤ expiry)]
+    RS --&gt; DB
+    WS --&gt; DB[(Postgres&lt;br/&gt;urls: short_code PK UNIQUE,&lt;br/&gt;original_url, expires_at, created_by)]
+    CACHE -.-&gt;|optional| CDN[CDN / edge redirect]
+
+    style CACHE fill:#1a4d2e,color:#fff
+    style CTR fill:#1a4d2e,color:#fff</pre>
+<p>The theme, in one sentence: <strong>the read:write asymmetry licensed every simplification.</strong> A single primary DB is fine because writes are 1/sec. A cache is enough because the hot set is small and immutable. A single Redis counter is fine because 100k ops/sec vs 1/sec is not a contest. The design is simple <em>because the numbers say it can be</em>, and being able to show that arithmetic is the whole interview.</p>
+<hr>
+<h2 id="9-interview-questions-they-will-actually-ask">9. Interview Questions They Will Actually Ask</h2>
+<ol>
+<li><strong>Why 302 and not 301?</strong> Control: expiration, edits, analytics. 301 lets the browser bypass you forever.</li>
+<li><strong>How do you guarantee uniqueness?</strong> Counter + base62 (no collisions) <em>or</em> hash + truncate + <code>UNIQUE</code> + bounded retry. Know both, choose the counter, explain the predictability trade.</li>
+<li><strong>How long are the codes?</strong> 6 chars covers 56B (62⁶). 7 chars covers 3.5T. 1B URLs → <code>15ftgG</code>.</li>
+<li><strong>Why base62 not base64?</strong> <code>/</code> and <code>+</code> are not URL-safe.</li>
+<li><strong>Custom alias collides with a generated code?</strong> Prefix/namespace separation, or check both on insert.</li>
+<li><strong>What if two users submit the same long URL?</strong> Two codes, by default. Dedup is a product decision, not a correctness one.</li>
+<li><strong>What if Redis (counter) goes down?</strong> Batching means writes continue until local ranges drain. Failover via Sentinel. Lost increments are fine; <code>UNIQUE</code> catches any double-issue.</li>
+<li><strong>What if the cache goes down?</strong> DB + replicas serve reads, slower. Availability over latency. Never fail the redirect because the cache is gone.</li>
+<li><strong>Expired links?</strong> 410 Gone. Cache TTL ≤ expiry; optional sweeper job.</li>
+<li><strong>How do you stop enumeration of all links?</strong> Secret bijection on the id before encoding, or accept public-by-design. Rate-limit the read path (see design-rate-limiter) so scanning is expensive.</li>
+<li><strong>Traffic 10×?</strong> Reads: more Read Service instances and a bigger cache, then CDN. Writes: still 10/sec. Nothing structural changes, and saying so confidently is the point.</li>
+<li><strong>Add analytics without slowing redirects.</strong> Emit a click event to Kafka <em>after</em> sending the 302; a consumer aggregates. Never put analytics on the synchronous path.</li>
+</ol>
+<hr>
+<h2 id="10-what-interviewers-expect-by-level">10. What Interviewers Expect, by Level</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Mid</th>
+<th>Senior</th>
+<th>Staff+</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>High-level design</td>
+<td>The deliverable: working create + redirect</td>
+<td>Done quickly to bank time for depth</td>
+<td>Assumed</td>
+</tr>
+<tr>
+<td>Code generation</td>
+<td>One reasonable approach (hash <em>or</em> counter)</td>
+<td>Both, with the collision vs coordination tradeoff unprompted</td>
+<td>Also the predictability/enumeration risk and a mitigation</td>
+</tr>
+<tr>
+<td>Read path</td>
+<td>Recognises a cache helps, with prompting</td>
+<td>Cache-aside, LRU, TTL vs expiry, invalidation on delete</td>
+<td>Edge/CDN option with its cost trade; negative caching</td>
+</tr>
+<tr>
+<td>Scaling</td>
+<td>Horizontal scaling of the server</td>
+<td>Read/write service split justified by the ratio; Redis counter across instances</td>
+<td>Counter batching, Redis failover semantics, multi-region range allocation, alias namespace collisions, expiry cleanup strategy</td>
+</tr>
+<tr>
+<td>Who drives</td>
+<td>Interviewer prompts</td>
+<td>Candidate drives</td>
+<td>Candidate drives; interviewer learns something</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="quick-recall-card">Quick Recall Card</h2>
+<table>
+<thead>
+<tr>
+<th>Problem</th>
+<th>Answer</th>
+<th>One-line why</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Unique short codes</td>
+<td>Redis <code>INCR</code> → base62</td>
+<td>Atomic, collision-free, 6 chars at 1B</td>
+</tr>
+<tr>
+<td>Hash alternative</td>
+<td>sha256 → base62 → first 8 + <code>UNIQUE</code> + ≤5 retries</td>
+<td>Collision prob = n / 62⁸; needs the retry loop</td>
+</tr>
+<tr>
+<td>Redirect status</td>
+<td>302</td>
+<td>Keeps control: expiry, edits, analytics</td>
+</tr>
+<tr>
+<td>&lt; 100ms redirects</td>
+<td>Redis cache-aside, LRU, TTL ≤ expiry</td>
+<td>Hot set is small and immutable</td>
+</tr>
+<tr>
+<td>1B URLs</td>
+<td>500 GB → single Postgres + replicas</td>
+<td>Writes ≈ 1/sec; sharding is premature</td>
+</tr>
+<tr>
+<td>Many write instances</td>
+<td><code>INCRBY 1000</code> batches per instance</td>
+<td>1000× fewer Redis calls; gaps are fine</td>
+</tr>
+<tr>
+<td>Counter failover</td>
+<td>Sentinel + DB <code>UNIQUE</code> backstop</td>
+<td>Need unique, not contiguous</td>
+</tr>
+<tr>
+<td>Multi-region</td>
+<td>Disjoint id ranges per region</td>
+<td>No cross-region coordination on writes</td>
+</tr>
+<tr>
+<td>Enumeration risk</td>
+<td>Secret bijection before base62, rate limit reads</td>
+<td>Sequential ids are guessable</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>See also:</strong> 03-caching for cache-aside vs read-through and eviction policies; <a href="/dealing-with-contention/">14-dealing-with-contention</a> for why the DB <code>UNIQUE</code> constraint is the right backstop (conditional write, rung 1 of the ladder).</p>
+</blockquote>
+
+  </div>
+  <nav class="related"><h2>Related posts</h2><ul><li><a href="/dealing-with-contention/">Dealing with Contention</a></li></ul></nav>
+</article>
+
+</main>
+<footer class="foot">
+  <p>Kumar Saurav · 2026 · Generated from study notes. Diagrams render with Mermaid; code highlighting by highlight.js.</p>
+</footer>
+</body>
+</html>
